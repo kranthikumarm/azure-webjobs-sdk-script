@@ -25,8 +25,10 @@ using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Azure.WebJobs.Script.Scaling;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Handlers;
+using Microsoft.Azure.WebJobs.Script.WebHost.Scale;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
@@ -206,6 +208,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public void Initialize()
         {
+            if (AppServiceScaleManager.Enabled)
+            {
+                var statusProvider = new WorkerStatusProvider(_performanceManager, _config.TraceWriter);
+                AppServiceScaleManager.RegisterProvider(statusProvider);
+            }
+
             lock (_syncLock)
             {
                 if (InStandbyMode)

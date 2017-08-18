@@ -6,7 +6,7 @@ using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Newtonsoft.Json;
 
-namespace Microsoft.Azure.WebJobs.Script.Diagnostics
+namespace Microsoft.Azure.WebJobs.Script.WebHost.Scale
 {
     public class HostPerformanceManager
     {
@@ -17,6 +17,11 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
 
         private readonly ScriptSettingsManager _settingsManager;
         private readonly TraceWriter _traceWriter;
+
+        // for mock testing
+        public HostPerformanceManager()
+        {
+        }
 
         public HostPerformanceManager(ScriptSettingsManager settingsManager, TraceWriter traceWriter)
         {
