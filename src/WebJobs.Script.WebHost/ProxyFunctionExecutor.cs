@@ -2,56 +2,56 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web.Http;
-using System.Web.Http.Controllers;
 using System.Web.Http.Dependencies;
 using Microsoft.Azure.AppService.Proxy.Client.Contract;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Description;
-using Microsoft.Azure.WebJobs.Script.Host;
-using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
+using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
 using Microsoft.Azure.WebJobs.Script.WebHost.WebHooks;
 
-namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
+namespace Microsoft.Azure.WebJobs.Script.Host
 {
-    /// <summary>
-    /// Controller responsible for handling all http function invocations.
-    /// </summary>
-    public class FunctionsController : ApiController
+    public class ProxyFunctionExecutor : IFuncExecutor
     {
         private readonly WebScriptHostManager _scriptHostManager;
+        private readonly IDependencyResolver _dependencyResolver;
         private WebHookReceiverManager _webHookReceiverManager;
 
-        public FunctionsController(WebScriptHostManager scriptHostManager, WebHookReceiverManager webHookReceiverManager)
+        internal ProxyFunctionExecutor(WebScriptHostManager scriptHostManager, WebHookReceiverManager webHookReceiverManager, IDependencyResolver dependencyResolver)
         {
             _scriptHostManager = scriptHostManager;
             _webHookReceiverManager = webHookReceiverManager;
+            _dependencyResolver = dependencyResolver;
         }
 
-        public override async Task<HttpResponseMessage> ExecuteAsync(HttpControllerContext controllerContext, CancellationToken cancellationToken)
+        public async Task ExecuteFuncAsync(string funcName, Dictionary<string, object> arguments, CancellationToken cancellationToken)
         {
-            var request = controllerContext.Request;
+            HttpRequestMessage request = arguments["MS_AzureFunctionsHttpRequest"] as HttpRequestMessage;
             var function = _scriptHostManager.GetHttpFunctionOrNull(request);
             if (function == null)
             {
                 // request does not map to an HTTP function
-                return new HttpResponseMessage(HttpStatusCode.NotFound);
+                request.Properties["MS_AzureFunctionsHttpResponse"] = new HttpResponseMessage(HttpStatusCode.NotFound);
+                return;
             }
             request.SetProperty(ScriptConstants.AzureFunctionsHttpFunctionKey, function);
 
-            var authorizationLevel = await DetermineAuthorizationLevelAsync(request, function, controllerContext.Configuration.DependencyResolver);
+            var authorizationLevel = await FunctionsController.DetermineAuthorizationLevelAsync(request, function, _dependencyResolver);
             if (function.Metadata.IsExcluded ||
                (function.Metadata.IsDisabled && !(request.IsAuthDisabled() || authorizationLevel == AuthorizationLevel.Admin)))
             {
                 // disabled functions are not publicly addressable w/o Admin level auth,
                 // and excluded functions are also ignored here (though the check above will
                 // already exclude them)
-                return new HttpResponseMessage(HttpStatusCode.NotFound);
+                request.Properties["MS_AzureFunctionsHttpResponse"] = new HttpResponseMessage(HttpStatusCode.NotFound);
+                return;
             }
 
             Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> processRequestHandler = async (req, ct) =>
@@ -59,20 +59,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 return await ProcessRequestAsync(req, function, ct);
             };
 
-            IFuncExecutor proxyFunctionExecutor = new ProxyFunctionExecutor(this._scriptHostManager, this._webHookReceiverManager, controllerContext.Configuration.DependencyResolver);
-            request.Properties.Add("AzureFuncExecutor", proxyFunctionExecutor);
-            return await _scriptHostManager.HttpRequestManager.ProcessRequestAsync(request, processRequestHandler, cancellationToken);
-        }
-
-        public static async Task<AuthorizationLevel> DetermineAuthorizationLevelAsync(HttpRequestMessage request, FunctionDescriptor function, IDependencyResolver resolver)
-        {
-            var secretManager = resolver.GetService<ISecretManager>();
-            var authorizationResult = await AuthorizationLevelAttribute.GetAuthorizationResultAsync(request, secretManager, functionName: function.Name);
-            var authorizationLevel = authorizationResult.AuthorizationLevel;
-            request.SetAuthorizationLevel(authorizationLevel);
-            request.SetProperty(ScriptConstants.AzureFunctionsHttpRequestKeyNameKey, authorizationResult.KeyName);
-
-            return authorizationLevel;
+            var resp = await _scriptHostManager.HttpRequestManager.ProcessRequestAsync(request, processRequestHandler, cancellationToken);
+            request.Properties["MS_AzureFunctionsHttpResponse"] = resp;
+            return;
         }
 
         private async Task<HttpResponseMessage> ProcessRequestAsync(HttpRequestMessage request, FunctionDescriptor function, CancellationToken cancellationToken)

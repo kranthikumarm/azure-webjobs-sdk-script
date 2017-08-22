@@ -24,7 +24,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
         public async Task Execute(HttpRequestMessage request, ILogger logger)
         {
-            await _proxyClient.CallAsync(new object[] { request }, null, logger);
+            var proxyFunctionExecutor = request.Properties["AzureFuncExecutor"] as IFuncExecutor;
+            await _proxyClient.CallAsync(new object[] { request }, proxyFunctionExecutor, logger);
         }
     }
 }
