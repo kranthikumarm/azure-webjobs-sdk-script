@@ -3,22 +3,23 @@
 
 using System;
 using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
     public interface IFunctionInvoker
     {
         /// <summary>
-        /// Gets logging information for this function.
+        /// Gets the <see cref="ILogger"/> for this function.
         /// </summary>
-        FunctionLogger LogInfo { get; }
+        ILogger FunctionLogger { get; }
 
         /// <summary>
         /// Invoke the function using the specified parameters.
         /// </summary>
         /// <param name="parameters">The parameters.</param>
         /// <returns>A <see cref="Task"/> for the invocation.</returns>
-        Task Invoke(object[] parameters);
+        Task<object> Invoke(object[] parameters);
 
         /// <summary>
         /// This method is called by the host when invocation exceptions occur

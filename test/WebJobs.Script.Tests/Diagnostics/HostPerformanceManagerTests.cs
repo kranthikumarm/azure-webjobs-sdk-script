@@ -2,10 +2,9 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Collections.ObjectModel;
-using System.Diagnostics;
 using System.Linq;
-using Microsoft.Azure.WebJobs.Script.Config;
-using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Scale;
+using Microsoft.Extensions.Options;
 using Moq;
 using Xunit;
 
@@ -16,29 +15,30 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Diagnostics
         [Fact]
         public void GetCounters_ReturnsExpectedResult()
         {
-            var mockSettings = new Mock<ScriptSettingsManager>(MockBehavior.Strict);
+            var mockEnvironment = new Mock<IEnvironment>(MockBehavior.Strict);
             string value = string.Empty;
-            var traceWriter = new TestTraceWriter(TraceLevel.Verbose);
-            mockSettings.Setup(p => p.GetSetting(EnvironmentSettingNames.AzureWebsiteAppCountersName)).Returns(() => value);
-            var performanceManager = new HostPerformanceManager(mockSettings.Object, traceWriter);
+            var logger = new TestLogger("Test");
+            mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteAppCountersName)).Returns(() => value);
+            var options = new HostHealthMonitorOptions();
+            var performanceManager = new HostPerformanceManager(mockEnvironment.Object, new OptionsWrapper<HostHealthMonitorOptions>(options));
 
             value = "{\"userTime\": 30000000,\"kernelTime\": 16562500,\"pageFaults\": 131522,\"processes\": 1,\"processLimit\": 32,\"threads\": 32,\"threadLimit\": 512,\"connections\": 4,\"connectionLimit\": 300,\"sections\": 3,\"sectionLimit\": 256,\"namedPipes\": 0,\"namedPipeLimit\": 128,\"readIoOperations\": 675,\"writeIoOperations\": 18,\"otherIoOperations\": 9721,\"readIoBytes\": 72585119,\"writeIoBytes\": 5446,\"otherIoBytes\": 393926,\"privateBytes\": 33759232,\"handles\": 987,\"contextSwitches\": 15535,\"remoteOpens\": 250}";
-            var counters = performanceManager.GetPerformanceCounters();
+            var counters = performanceManager.GetPerformanceCounters(logger);
             Assert.Equal(counters.PageFaults, 131522);
 
             value = "{\"userTime\": 30000000,\"kernelTime\": 16562500,\"pageFaults\": 131522,\"processes\": 1,\"processLimit\": 32,\"threads\": 32,\"threadLimit\": 512,\"connections\": 4,\"connectionLimit\": 300,\"sections\": 3,\"sectionLimit\": 256,\"namedPipes\": 0,\"namedPipeLimit\": 128,\"readIoOperations\": 675,\"writeIoOperations\": 18,\"otherIoOperations\": 9721,\"readIoBytes\": 72585119,\"writeIoBytes\": 5446,\"otherIoBytes\": 393926,\"privateBytes\": 33759232,\"handles\": 987,\"contextSwitches\": 15535,\"remoteOpens\": 250}猅";
-            counters = performanceManager.GetPerformanceCounters();
+            counters = performanceManager.GetPerformanceCounters(logger);
             Assert.Equal(counters.PageFaults, 131522);
 
             value = "{}";
-            counters = performanceManager.GetPerformanceCounters();
+            counters = performanceManager.GetPerformanceCounters(logger);
             Assert.Equal(counters.PageFaults, 0);
 
             value = "this is not json";
-            counters = performanceManager.GetPerformanceCounters();
+            counters = performanceManager.GetPerformanceCounters(logger);
             Assert.Null(counters);
-            var error = traceWriter.Traces.Last();
-            Assert.Equal("Failed to deserialize application performance counters. JSON Content: \"this is not json\"", error.Message);
+            var error = logger.GetLogMessages().Last();
+            Assert.Equal("Failed to deserialize application performance counters. JSON Content: \"this is not json\"", error.FormattedMessage);
         }
 
         [Theory]

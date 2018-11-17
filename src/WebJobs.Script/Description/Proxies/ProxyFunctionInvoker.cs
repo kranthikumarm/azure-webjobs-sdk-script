@@ -2,13 +2,10 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections.Generic;
 using System.Linq;
-using System.Management.Automation;
-using System.Net.Http;
-using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Azure.AppService.Proxy.Client.Contract;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
@@ -16,22 +13,23 @@ namespace Microsoft.Azure.WebJobs.Script.Description
     {
         private ProxyClientExecutor _proxyClient;
 
-        public ProxyFunctionInvoker(ScriptHost host, FunctionMetadata functionMetadata, ProxyClientExecutor proxyClient)
-            : base(host, functionMetadata, new FunctionLogger(host, functionMetadata.Name, logDirName: "Proxy"))
+        public ProxyFunctionInvoker(ScriptHost host, FunctionMetadata functionMetadata, ProxyClientExecutor proxyClient, ILoggerFactory loggerFactory)
+            : base(host, functionMetadata, loggerFactory)
         {
             _proxyClient = proxyClient;
         }
 
-        protected override async Task InvokeCore(object[] parameters, FunctionInvocationContext context)
+        protected override async Task<object> InvokeCore(object[] parameters, FunctionInvocationContext context)
         {
-            object requestObj = (parameters != null && parameters.Any()) ? parameters[0] : null;
+            HttpRequest requestObj = parameters?.FirstOrDefault() as HttpRequest;
 
-            if (requestObj == null || !(requestObj is HttpRequestMessage))
+            if (requestObj == null)
             {
-                throw new Exception("Could not find parameter of type HttpRequestMessage while executing a Proxy Request");
+                throw new Exception("Could not find parameter of type HttpRequest while executing a Proxy Request");
             }
 
-            await _proxyClient.Execute(requestObj as HttpRequestMessage, context.Logger);
+            await _proxyClient.Execute(requestObj, context.Logger);
+            return requestObj.HttpContext.Items[ScriptConstants.AzureFunctionsHttpResponseKey];
         }
     }
 }

@@ -7,9 +7,17 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
     {
         // host level events
         public const string ApplicationStartLatency = "host.application.start";
-        public const string HostStartupLatency = "host.startup.latency";
         public const string ApplicationInsightsEnabled = "host.applicationinsights.enabled";
         public const string ApplicationInsightsDisabled = "host.applicationinsights.disabled";
+        public const string HostStartupLatency = "host.startup.latency";
+        public const string HostStartupReadFunctionMetadataLatency = "host.startup.readfunctionmetadata.latency";
+        public const string HostStartupInitializeBindingProvidersLatency = "host.startup.initializebindingproviders.latency";
+        public const string HostStartupCreateMetadataProviderLatency = "host.startup.createmetadataprovider.latency";
+        public const string HostStartupGetFunctionDescriptorsLatency = "host.startup.getfunctiondescriptors.latency";
+        public const string HostStartupGrpcServerLatency = "host.startup.outofproc.grpcserver.initialize.latency";
+
+        // language worker level events
+        public const string WorkerInitializeLatency = "host.startup.outofproc.{0}worker.initialize.attempt{1}.latency";
 
         // function level events
         public const string FunctionInvokeLatency = "function.invoke.latency";
@@ -17,5 +25,6 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         public const string FunctionBindingTypeDirectionFormat = "function.binding.{0}.{1}";
         public const string FunctionCompileLatencyByLanguageFormat = "function.compile.{0}.latency";
         public const string FunctionInvokeThrottled = "function.invoke.throttled";
+        public const string FunctionUserLog = "function.userlog";
     }
 }

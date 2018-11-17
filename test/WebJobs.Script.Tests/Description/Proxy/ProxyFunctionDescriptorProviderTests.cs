@@ -2,45 +2,73 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Collections.ObjectModel;
 using System.IO;
-using System.Net;
+using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
-using Microsoft.Azure.AppService.Proxy.Client.Contract;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.AppService.Proxy.Client;
+using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
-    public class ProxyFunctionDescriptorProviderTests : IDisposable
+    public class ProxyFunctionDescriptorProviderTests : IAsyncLifetime, IDisposable
     {
-        private readonly ScriptHost _host;
+        private readonly ScriptHost _scriptHost;
         private readonly ScriptSettingsManager _settingsManager;
-
+        private readonly IHost _host;
         private readonly ProxyClientExecutor _proxyClient;
-        private readonly ScriptHostConfiguration _config;
-        private Collection<FunctionMetadata> _metadataCollection;
+        private ImmutableArray<FunctionMetadata> _metadataCollection;
 
         public ProxyFunctionDescriptorProviderTests()
         {
             string rootPath = Path.Combine(Environment.CurrentDirectory, @"TestScripts\Proxies");
-            _config = new ScriptHostConfiguration
-            {
-                RootScriptPath = rootPath
-            };
 
-            var environment = new Mock<IScriptHostEnvironment>();
+            var hostOptions = new JobHostOptions();
+            var environment = new Mock<IScriptJobHostEnvironment>();
             var eventManager = new Mock<IScriptEventManager>();
+            var contextFactory = new Mock<IJobHostContextFactory>();
 
             _proxyClient = GetMockProxyClient();
             _settingsManager = ScriptSettingsManager.Instance;
-            _host = ScriptHost.Create(environment.Object, eventManager.Object, _config, _settingsManager, _proxyClient);
-            _metadataCollection = _host.ReadProxyMetadata(_config, _settingsManager);
+            _host = new HostBuilder()
+                .ConfigureDefaultTestWebScriptHost(o =>
+                {
+                    o.ScriptPath = rootPath;
+                    o.LogPath = TestHelpers.GetHostLogFileDirectory().Parent.FullName;
+                })
+                .Build();
+
+            _scriptHost = _host.GetScriptHost();
+        }
+
+        public async Task InitializeAsync()
+        {
+            await _scriptHost.StartAsync();
+
+            _metadataCollection = _host.Services.GetService<IProxyMetadataManager>()
+                .ProxyMetadata.Functions;
+        }
+
+        public async Task DisposeAsync()
+        {
+            await _scriptHost.StopAsync();
         }
 
         private ProxyClientExecutor GetMockProxyClient()
@@ -48,19 +76,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var proxyClient = new Mock<IProxyClient>();
 
             ProxyData proxyData = new ProxyData();
-            proxyData.Routes.Add(new Routes()
-            {
-                Methods = new[] { HttpMethod.Get, HttpMethod.Post },
-                Name = "test",
-                UrlTemplate = "/myproxy"
-            });
+            proxyData.Routes.Add(new Routes("/myproxy", "test", new[] { HttpMethod.Get, HttpMethod.Post }));
 
-            proxyData.Routes.Add(new Routes()
-            {
-                Methods = new[] { HttpMethod.Get },
-                Name = "localFunction",
-                UrlTemplate = "/mymockhttp"
-            });
+            proxyData.Routes.Add(new Routes("/mymockhttp", "localFunction", new[] { HttpMethod.Get }));
 
             proxyClient.Setup(p => p.GetProxyData()).Returns(proxyData);
 
@@ -68,10 +86,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 (object[] arguments, IFuncExecutor funcExecutor, ILogger logger) =>
                 {
                     object requestObj = arguments != null && arguments.Length > 0 ? arguments[0] : null;
-                    var request = requestObj as HttpRequestMessage;
-                    var response = new HttpResponseMessage(HttpStatusCode.OK);
-                    response.Headers.Add("myversion", "123");
-                    request.Properties[ScriptConstants.AzureFunctionsHttpResponseKey] = response;
+                    var request = requestObj as HttpRequest;
+                    var response = new StatusCodeResult(StatusCodes.Status200OK);
+                    request.HttpContext.Response.Headers.Add("myversion", "123");
+                    request.HttpContext.Items[ScriptConstants.AzureFunctionsHttpResponseKey] = response;
                     return Task.CompletedTask;
                 });
 
@@ -79,14 +97,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
-        public void ValidateProxyFunctionDescriptor()
+        public async Task ValidateProxyFunctionDescriptor()
         {
             var proxy = _proxyClient as ProxyClientExecutor;
             Assert.NotNull(proxy);
 
-            var proxyFunctionDescriptor = new ProxyFunctionDescriptorProvider(_host, _config, proxy);
+            var proxyFunctionDescriptor = new ProxyFunctionDescriptorProvider(_scriptHost, _scriptHost.ScriptOptions, _host.Services.GetService<ICollection<IScriptBindingProvider>>(), proxy, NullLoggerFactory.Instance);
 
-            Assert.True(proxyFunctionDescriptor.TryCreate(_metadataCollection[0], out FunctionDescriptor functionDescriptor));
+            var (created, functionDescriptor) = await proxyFunctionDescriptor.TryCreate(_metadataCollection[0]);
+
+            Assert.True(created);
 
             var proxyInvoker = functionDescriptor.Invoker as ProxyFunctionInvoker;
 
@@ -96,13 +116,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public async Task ValidateProxyFunctionInvoker()
         {
-            var proxyFunctionDescriptor = new ProxyFunctionDescriptorProvider(_host, _config, _proxyClient);
+            var proxyFunctionDescriptor = new ProxyFunctionDescriptorProvider(_scriptHost, _scriptHost.ScriptOptions, _host.Services.GetService<ICollection<IScriptBindingProvider>>(), _proxyClient, NullLoggerFactory.Instance);
 
-            proxyFunctionDescriptor.TryCreate(_metadataCollection[0], out FunctionDescriptor functionDescriptor);
+            var (created, functionDescriptor) = await proxyFunctionDescriptor.TryCreate(_metadataCollection[0]);
 
             var proxyInvoker = functionDescriptor.Invoker as ProxyFunctionInvoker;
 
-            var req = new HttpRequestMessage(HttpMethod.Get, "http://localhost/myproxy");
+            var req = HttpTestHelpers.CreateHttpRequest("GET", "http://localhost/myproxy");
 
             var executionContext = new ExecutionContext
             {
@@ -112,9 +132,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             await proxyInvoker.Invoke(parameters);
 
-            Assert.NotNull(req.Properties[ScriptConstants.AzureFunctionsHttpResponseKey]);
+            Assert.NotNull(req.HttpContext.Items[ScriptConstants.AzureFunctionsHttpResponseKey]);
 
-            var response = req.Properties[ScriptConstants.AzureFunctionsHttpResponseKey] as HttpResponseMessage;
+            var response = req.HttpContext.Items[ScriptConstants.AzureFunctionsHttpResponseKey] as IActionResult;
 
             Assert.NotNull(response);
         }
@@ -123,7 +143,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             if (disposing)
             {
-                _host?.Dispose();
+                _scriptHost?.Dispose();
             }
         }
 

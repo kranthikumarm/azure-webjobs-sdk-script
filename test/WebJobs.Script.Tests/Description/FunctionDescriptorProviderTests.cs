@@ -2,13 +2,19 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
-using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
-using Microsoft.Azure.WebJobs.Script.Eventing;
+using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Options;
+using Microsoft.WebJobs.Script.Tests;
 using Moq;
+using Newtonsoft.Json.Linq;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
@@ -17,21 +23,25 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     {
         private readonly FunctionDescriptorProvider _provider;
         private readonly ScriptHost _host;
-        private readonly ScriptSettingsManager _settingsManager;
 
         public FunctionDescriptorProviderTests()
         {
             string rootPath = Path.Combine(Environment.CurrentDirectory, @"TestScripts\Node");
-            ScriptHostConfiguration config = new ScriptHostConfiguration
-            {
-                RootScriptPath = rootPath
-            };
 
-            var environment = new Mock<IScriptHostEnvironment>();
-            var eventManager = new Mock<IScriptEventManager>();
-            _settingsManager = ScriptSettingsManager.Instance;
-            _host = ScriptHost.Create(environment.Object, eventManager.Object, config, _settingsManager);
-            _provider = new TestDescriptorProvider(_host, config);
+            var host = new HostBuilder()
+                .ConfigureDefaultTestWebScriptHost(webJobsBuilder =>
+                {
+                    webJobsBuilder.AddAzureStorage();
+                },
+                o =>
+                {
+                    o.ScriptPath = rootPath;
+                    o.LogPath = TestHelpers.GetHostLogFileDirectory().Parent.FullName;
+                })
+                .Build();
+            _host = host.GetScriptHost();
+            _host.InitializeAsync().GetAwaiter().GetResult();
+            _provider = new TestDescriptorProvider(_host, host.Services.GetService<IOptions<ScriptJobHostOptions>>().Value, host.Services.GetService<ICollection<IScriptBindingProvider>>());
         }
 
         [Fact]
@@ -76,6 +86,61 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             });
 
             Assert.Equal("No trigger binding specified. A function must have a trigger input binding.", ex.Message);
+        }
+
+        [Fact]
+        public async Task VerifyResolvedBindings_WithNoBindingMatch_ThrowsExpectedException()
+        {
+            FunctionMetadata functionMetadata = new FunctionMetadata();
+            BindingMetadata triggerMetadata = BindingMetadata.Create(JObject.Parse("{\"type\": \"blobTrigger\",\"name\": \"req\",\"direction\": \"in\", \"blobPath\": \"test\"}"));
+            BindingMetadata bindingMetadata = BindingMetadata.Create(JObject.Parse("{\"type\": \"unknownbinding\",\"name\": \"blob\",\"direction\": \"in\"}"));
+
+            functionMetadata.Bindings.Add(triggerMetadata);
+            functionMetadata.Bindings.Add(bindingMetadata);
+
+            var ex = await Assert.ThrowsAsync<FunctionConfigurationException>(async () =>
+            {
+                var (created, descriptor) = await _provider.TryCreate(functionMetadata);
+            });
+
+            Assert.Contains("unknownbinding", ex.Message);
+        }
+
+        [Fact]
+        public async Task VerifyResolvedBindings_WithValidBindingMatch_DoesNotThrow()
+        {
+            FunctionMetadata functionMetadata = new FunctionMetadata();
+            BindingMetadata triggerMetadata = BindingMetadata.Create(JObject.Parse("{\"type\": \"httpTrigger\",\"name\": \"req\",\"direction\": \"in\"}"));
+            BindingMetadata bindingMetadata = BindingMetadata.Create(JObject.Parse("{\"type\": \"http\",\"name\": \"$return\",\"direction\": \"out\"}"));
+
+            functionMetadata.Bindings.Add(triggerMetadata);
+            functionMetadata.Bindings.Add(bindingMetadata);
+            try
+            {
+                var (created, descriptor) = await _provider.TryCreate(functionMetadata);
+                Assert.True(true, "No exception thrown");
+            }
+            catch (Exception ex)
+            {
+                Assert.True(false, "Exception not expected:" + ex.Message);
+                throw;
+            }
+        }
+
+        [Fact]
+        public async Task CreateTriggerParameter_WithNoBindingMatch_ThrowsExpectedException()
+        {
+            FunctionMetadata functionMetadata = new FunctionMetadata();
+            BindingMetadata metadata = BindingMetadata.Create(JObject.Parse("{\"type\": \"someInvalidTrigger\",\"name\": \"req\",\"direction\": \"in\"}"));
+
+            functionMetadata.Bindings.Add(metadata);
+
+            var ex = await Assert.ThrowsAsync<FunctionConfigurationException>(async () =>
+            {
+                var (created, descriptor) = await _provider.TryCreate(functionMetadata);
+            });
+
+            Assert.Contains("someInvalidTrigger", ex.Message);
         }
 
         [Theory]
@@ -140,13 +205,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         private class TestDescriptorProvider : FunctionDescriptorProvider
         {
-            public TestDescriptorProvider(ScriptHost host, ScriptHostConfiguration config) : base(host, config)
+            public TestDescriptorProvider(ScriptHost host, ScriptJobHostOptions config, ICollection<IScriptBindingProvider> bindingProviders)
+                : base(host, config, bindingProviders)
             {
             }
 
             protected override IFunctionInvoker CreateFunctionInvoker(string scriptFilePath, BindingMetadata triggerMetadata, FunctionMetadata functionMetadata, Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
             {
-                throw new NotImplementedException();
+                return new Mock<IFunctionInvoker>().Object;
             }
         }
     }

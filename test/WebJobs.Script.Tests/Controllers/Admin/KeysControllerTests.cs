@@ -4,17 +4,19 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
-using System.Diagnostics;
-using System.Net;
-using System.Net.Http;
+using System.IO;
+using System.IO.Abstractions;
 using System.Threading.Tasks;
-using System.Web.Http.Results;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
-using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Moq;
 using Newtonsoft.Json.Linq;
 using WebJobs.Script.Tests;
@@ -26,8 +28,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     {
         private readonly ScriptSettingsManager _settingsManager;
         private readonly TempDirectory _secretsDirectory = new TempDirectory();
-        private Mock<ScriptHost> _hostMock;
-        private Mock<WebScriptHostManager> _managerMock;
         private Collection<FunctionDescriptor> _testFunctions;
         private Dictionary<string, Collection<string>> _testFunctionErrors;
         private KeysController _testController;
@@ -39,72 +39,125 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _testFunctions = new Collection<FunctionDescriptor>();
             _testFunctionErrors = new Dictionary<string, Collection<string>>();
 
-            var config = new ScriptHostConfiguration();
+            string rootScriptPath = @"c:\test\functions";
             var environment = new NullScriptHostEnvironment();
             var eventManager = new Mock<IScriptEventManager>();
-            _hostMock = new Mock<ScriptHost>(MockBehavior.Strict, new object[] { environment, eventManager.Object, config, null, null });
-            _hostMock.Setup(p => p.Functions).Returns(_testFunctions);
-            _hostMock.Setup(p => p.FunctionErrors).Returns(_testFunctionErrors);
+            var mockRouter = new Mock<IWebJobsRouter>();
 
-            WebHostSettings settings = new WebHostSettings();
-            settings.SecretsPath = _secretsDirectory.Path;
+            var settings = new ScriptApplicationHostOptions()
+            {
+                ScriptPath = rootScriptPath,
+                SecretsPath = _secretsDirectory.Path
+            };
             _secretsManagerMock = new Mock<ISecretManager>(MockBehavior.Strict);
-            _managerMock = new Mock<WebScriptHostManager>(MockBehavior.Strict, new object[] { config, new TestSecretManagerFactory(_secretsManagerMock.Object), eventManager.Object, _settingsManager, settings });
-            _managerMock.SetupGet(p => p.Instance).Returns(_hostMock.Object);
 
-            var traceWriter = new TestTraceWriter(TraceLevel.Verbose);
+            var fileSystem = new Mock<IFileSystem>();
+            var fileBase = new Mock<FileBase>();
+            var dirBase = new Mock<DirectoryBase>();
 
-            _testController = new KeysController(_managerMock.Object, _secretsManagerMock.Object, traceWriter, null);
+            fileSystem.SetupGet(f => f.File).Returns(fileBase.Object);
+            fileBase.Setup(f => f.ReadAllText(Path.Combine(rootScriptPath, "TestFunction1", ScriptConstants.FunctionMetadataFileName))).Returns("{}");
+            fileBase.Setup(f => f.ReadAllText(Path.Combine(rootScriptPath, "TestFunction2", ScriptConstants.FunctionMetadataFileName))).Returns("{}");
+            fileBase.Setup(f => f.ReadAllText(Path.Combine(rootScriptPath, "DNE", ScriptConstants.FunctionMetadataFileName))).Throws(new DirectoryNotFoundException());
 
-            // setup some test functions
-            string errorFunction = "ErrorFunction";
-            var errors = new Collection<string>();
-            errors.Add("A really really bad error!");
-            _testFunctionErrors.Add(errorFunction, errors);
+            _testController = new KeysController(new OptionsWrapper<ScriptApplicationHostOptions>(settings), new TestSecretManagerProvider(_secretsManagerMock.Object), new LoggerFactory(), fileSystem.Object);
 
             var keys = new Dictionary<string, string>
             {
                 { "key1", "secret1" }
             };
-            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync(errorFunction, false)).ReturnsAsync(keys);
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("TestFunction1", false)).ReturnsAsync(keys);
+
+            keys = new Dictionary<string, string>
+            {
+                { "key1", "secret1" }
+            };
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("TestFunction2", false)).ReturnsAsync(keys);
+
+            _secretsManagerMock.Setup(p => p.GetFunctionSecretsAsync("DNE", false)).ReturnsAsync((IDictionary<string, string>)null);
+
+            SetHttpContext();
         }
 
         [Fact]
-        public async Task GetKeys_FunctionInError_ReturnsKeys()
+        public async Task GetKeys_ReturnsKeys()
         {
-            _testController.Request = new HttpRequestMessage(HttpMethod.Get, "https://local/admin/functions/keys");
-            var result = (OkNegotiatedContentResult<ApiModel>)(await _testController.Get("ErrorFunction"));
+            ObjectResult result = (ObjectResult)await _testController.Get("TestFunction1");
 
-            var content = (JObject)result.Content;
+            var content = (JObject)result.Value;
             var keys = content["keys"];
             Assert.Equal("key1", keys[0]["name"]);
             Assert.Equal("secret1", keys[0]["value"]);
         }
 
         [Fact]
-        public async Task PutKey_FunctionInError_Succeeds()
+        public async Task GetKeys_NotAFunction_ReturnsNotFound()
         {
-            _testController.Request = new HttpRequestMessage(HttpMethod.Get, "https://local/admin/functions/keys/key2");
+            var result = (StatusCodeResult)await _testController.Get("DNE");
 
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+        }
+
+        [Fact]
+        public async Task GetKeys_NotAKey_ReturnsNotFound()
+        {
+            var result = (StatusCodeResult)await _testController.Get("TestFunction1", "dne");
+
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+        }
+
+        [Fact]
+        public async Task PutKey_NotAFunction_ReturnsNotFound()
+        {
+            var key = new Key("key2", "secret2");
+
+            var result = (StatusCodeResult)(await _testController.Put("DNE", key.Name, key));
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+        }
+
+        [Fact]
+        public async Task PutKey_Succeeds()
+        {
             var key = new Key("key2", "secret2");
             var keyOperationResult = new KeyOperationResult(key.Value, OperationResult.Updated);
-            _secretsManagerMock.Setup(p => p.AddOrUpdateFunctionSecretAsync(key.Name, key.Value, "ErrorFunction", ScriptSecretsType.Function)).ReturnsAsync(keyOperationResult);
+            _secretsManagerMock.Setup(p => p.AddOrUpdateFunctionSecretAsync(key.Name, key.Value, "TestFunction1", ScriptSecretsType.Function)).ReturnsAsync(keyOperationResult);
 
-            var result = (OkNegotiatedContentResult<ApiModel>)(await _testController.Put("ErrorFunction", key.Name, key));
-            var content = (JObject)result.Content;
+            ObjectResult result = (ObjectResult)await _testController.Put("TestFunction1", key.Name, key);
+            var content = (JObject)result.Value;
             Assert.Equal("key2", content["name"]);
             Assert.Equal("secret2", content["value"]);
         }
 
         [Fact]
-        public async Task DeleteKey_FunctionInError_Succeeds()
+        public async Task DeleteKey_Succeeds()
         {
-            _testController.Request = new HttpRequestMessage(HttpMethod.Get, "https://local/admin/functions/keys/key2");
+            _secretsManagerMock.Setup(p => p.DeleteSecretAsync("key2", "TestFunction1", ScriptSecretsType.Function)).ReturnsAsync(true);
 
-            _secretsManagerMock.Setup(p => p.DeleteSecretAsync("key2", "ErrorFunction", ScriptSecretsType.Function)).ReturnsAsync(true);
+            var result = (StatusCodeResult)(await _testController.Delete("TestFunction1", "key2"));
+            Assert.Equal(StatusCodes.Status204NoContent, result.StatusCode);
+        }
 
-            var result = (StatusCodeResult)(await _testController.Delete("ErrorFunction", "key2"));
-            Assert.Equal(HttpStatusCode.NoContent, result.StatusCode);
+        [Fact]
+        public async Task DeleteKey_NotAFunction_ReturnsNotFound()
+        {
+            var result = (StatusCodeResult)(await _testController.Delete("DNE", "key2"));
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+        }
+
+        [Fact]
+        public async Task DeleteKey_NotAKey_ReturnsNotFound()
+        {
+            _secretsManagerMock.Setup(p => p.DeleteSecretAsync("dne", "TestFunction1", ScriptSecretsType.Function)).ReturnsAsync(false);
+
+            var result = (StatusCodeResult)(await _testController.Delete("TestFunction1", "dne"));
+            Assert.Equal(StatusCodes.Status404NotFound, result.StatusCode);
+        }
+
+        [Fact]
+        public async Task DeleteKey_InvalidKeyName_ReturnsBadRequest()
+        {
+            var result = (BadRequestObjectResult)(await _testController.Delete("TestFunction1", "_test"));
+            Assert.Equal("Invalid key name.", result.Value);
         }
 
         protected virtual void Dispose(bool disposing)
@@ -119,6 +172,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             // Do not change this code. Put cleanup code in Dispose(bool disposing) above.
             Dispose(true);
+        }
+
+        private void SetHttpContext()
+        {
+            var httpContext = new DefaultHttpContext();
+            httpContext.Request.Host = new HostString("local");
+            httpContext.Request.Path = "/admin/functions/keys/key2";
+            httpContext.Request.Method = "Get";
+            httpContext.Request.IsHttps = true;
+            _testController.ControllerContext.HttpContext = httpContext;
         }
     }
 }

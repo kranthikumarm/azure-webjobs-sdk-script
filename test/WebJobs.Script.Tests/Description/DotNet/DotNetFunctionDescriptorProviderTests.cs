@@ -6,6 +6,8 @@ using System.Reflection;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Extensions.Hosting;
+using Microsoft.WebJobs.Script.Tests;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -23,7 +25,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 { "direction", "out" },
                 { "path", "foo/bar" }
             };
-            FunctionBinding functionBinding = TestHelpers.CreateTestBinding(json);
+            var host = new HostBuilder().ConfigureDefaultTestWebScriptHost(b =>
+            {
+                b.AddAzureStorage();
+            }).Build();
+            FunctionBinding functionBinding = TestHelpers.CreateBindingFromHost(host, json);
             FunctionBinding[] bindings = new FunctionBinding[] { functionBinding };
 
             ParameterDescriptor descriptor = null;
@@ -41,11 +47,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Equal(typeof(string).MakeByRefType(), descriptor.Type);
             Assert.Equal(1, descriptor.CustomAttributes.Count);
 
-            var ex = Assert.Throws<InvalidOperationException>(() =>
-            {
-                DotNetFunctionDescriptorProvider.TryCreateReturnValueParameterDescriptor(typeof(Task), bindings, out descriptor);
-            });
-            Assert.Equal($"{ScriptConstants.SystemReturnParameterBindingName} cannot be bound to return type {typeof(Task).Name}.", ex.Message);
+            // return type task means no return value
+            result = DotNetFunctionDescriptorProvider.TryCreateReturnValueParameterDescriptor(typeof(Task), bindings, out descriptor);
+            Assert.False(result);
         }
 
         [Fact]
@@ -53,16 +57,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             JObject json = new JObject
             {
-                { "type", "blob" },
-                { "name", "myOutput" },
-                { "direction", "out" },
-                { "path", "foo/bar" }
+                { "type", "httpTrigger" },
+                { "name", "myInput" },
+                { "direction", "in" }
             };
             FunctionBinding functionBinding = TestHelpers.CreateTestBinding(json);
             FunctionBinding[] bindings = new FunctionBinding[] { functionBinding };
 
             ParameterDescriptor descriptor = null;
-            var result = DotNetFunctionDescriptorProvider.TryCreateReturnValueParameterDescriptor(typeof(string), bindings, out descriptor);
+            var result = DotNetFunctionDescriptorProvider.TryCreateReturnValueParameterDescriptor(typeof(void), bindings, out descriptor);
             Assert.False(result);
         }
     }

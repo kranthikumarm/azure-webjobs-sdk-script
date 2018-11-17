@@ -2,15 +2,20 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Collections.Generic;
-using Autofac;
+using System.Collections.ObjectModel;
+using System.Net.Http;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Extensions.DependencyInjection;
 using Moq;
+using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
 {
     public class KeyManagementFixture : ControllerScenarioTestFixture
     {
-        private readonly string _testFunctionName = "httptrigger-csharp";
+        private readonly string _testFunctionName = "httptrigger";
 
         public Dictionary<string, string> TestFunctionKeys { get; set; }
 
@@ -22,19 +27,37 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
 
         public virtual ScriptSecretsType SecretsType => ScriptSecretsType.Function;
 
-        protected override void RegisterDependencies(ContainerBuilder builder, WebHostSettings settings)
+        protected override void ConfigureWebHostBuilder(IWebHostBuilder webHostBuilder)
         {
-            TestFunctionKeys = new Dictionary<string, string>
+            base.ConfigureWebHostBuilder(webHostBuilder);
+
+            webHostBuilder.ConfigureServices(s =>
             {
-                { "key1", "1234" },
-                { "key2", "1234" }
-            };
+                TestFunctionKeys = new Dictionary<string, string>
+                {
+                    { "key1", "1234" },
+                    { "key2", "1234" }
+                };
 
-            SecretManagerMock = BuildSecretManager();
+                SecretManagerMock = BuildSecretManager();
 
-            builder.RegisterInstance<ISecretManager>(SecretManagerMock.Object);
+                s.AddSingleton<ISecretManagerProvider>(new TestSecretManagerProvider(SecretManagerMock.Object));
+            });
+        }
 
-            base.RegisterDependencies(builder, settings);
+        public static ApiModel ReadApiModelContent(HttpResponseMessage response)
+        {
+            var result = response.Content.ReadAsAsync<JObject>().Result;
+
+            var apimodel = new ApiModel();
+            apimodel.Merge(result);
+
+            if (result?["links"] != null)
+            {
+                apimodel.Links = result["links"].ToObject<Collection<Link>>();
+            }
+
+            return apimodel;
         }
 
         protected virtual Mock<TestSecretManager> BuildSecretManager()

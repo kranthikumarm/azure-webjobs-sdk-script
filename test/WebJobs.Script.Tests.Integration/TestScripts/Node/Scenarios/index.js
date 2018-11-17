@@ -1,7 +1,7 @@
 var util = require('util');
 var assert = require('assert');
 
-﻿module.exports = function (context, input) {
+module.exports = function (context, input) {
     var scenario = input.scenario;
 
     if (scenario === 'nextTick') {
@@ -55,14 +55,16 @@ var assert = require('assert');
         }
 
         // verify all binding data properties are camel cased
-        for (var key in context.bindingData)
-        {
+        for (var key in context.bindingData) {
             assert(isLowerCase(key[0]), "Expected lower case: " + key);
         }
 
         // verify that system properties were removed
         assert(!context._inputs);
         assert(!context._entryPoint);
+
+        // The test looks for this in the log to determine success.
+        context.log.info(input.value);
 
         context.done();
     }
@@ -88,24 +90,28 @@ var assert = require('assert');
     else if (scenario === 'appInsights') {
 
         var logPayload = {
-            InvocationId: context.executionContext.invocationId,
-            Trace: input.value
+            invocationId: context.executionContext.invocationId,
+            trace: input.value
         };
 
-        context.log(JSON.stringify(logPayload));
+        context.log(logPayload);
+
+        /* currently not supported in Node
         context.log.metric("TestMetric", 1234, {
             count: 50,
             min: 10.4,
             max: 23,
             MyCustomMetricProperty: 100
         });
+        */
+
         context.done();
     }
     else {
         // throw if the scenario didn't match
         throw new Error(util.format("The scenario '%s' did not match any known scenario.", scenario));
     }
-}
+};
 
 function isLowerCase(c) {
     return c.toLowerCase() === c;

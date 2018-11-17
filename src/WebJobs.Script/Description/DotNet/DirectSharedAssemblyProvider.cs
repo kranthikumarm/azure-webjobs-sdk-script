@@ -3,6 +3,8 @@
 
 using System;
 using System.Reflection;
+using System.Runtime.Loader;
+using Microsoft.Azure.WebJobs.Host;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
@@ -15,9 +17,9 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             _assembly = assembly;
         }
 
-        public bool TryResolveAssembly(string assemblyName, out Assembly assembly)
+        public bool TryResolveAssembly(string assemblyName, AssemblyLoadContext targetContext, out Assembly assembly)
         {
-            if (string.Compare(_assembly.GetName().Name, assemblyName, StringComparison.OrdinalIgnoreCase) == 0)
+            if (string.Compare(AssemblyNameCache.GetName(_assembly).Name, assemblyName, StringComparison.OrdinalIgnoreCase) == 0)
             {
                 assembly = _assembly;
                 return true;

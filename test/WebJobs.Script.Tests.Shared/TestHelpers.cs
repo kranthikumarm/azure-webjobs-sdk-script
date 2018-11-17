@@ -3,22 +3,27 @@
 
 using System;
 using System.Collections.Generic;
-using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Script.Binding;
-using Microsoft.Azure.WebJobs.Script.Description;
-using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Azure.WebJobs.Script.Abstractions;
+using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Options;
 using Microsoft.WindowsAzure.Storage.Blob;
-using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
-    public static class TestHelpers
+    public static partial class TestHelpers
     {
+        private const string Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        private static readonly Random Random = new Random();
+
         /// <summary>
         /// Gets the common root directory that functions tests create temporary directories under.
         /// This enables us to clean up test files by deleting this single directory.
@@ -31,26 +36,68 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
-        public static async Task Await(Func<bool> condition, int timeout = 60 * 1000, int pollingInterval = 2 * 1000, bool throwWhenDebugging = false)
+        public static async Task RunWithTimeoutAsync(Func<Task> action, TimeSpan timeout)
+        {
+            Task timeoutTask = Task.Delay(timeout);
+            Task actionTask = action();
+            Task completedTask = await Task.WhenAny(actionTask, timeoutTask);
+
+            if (completedTask == timeoutTask)
+            {
+                throw new Exception($"Task did not complete within timeout interval {timeout}.");
+            }
+        }
+
+        public static byte[] GenerateKeyBytes()
+        {
+            using (var aes = new AesManaged())
+            {
+                aes.GenerateKey();
+                return aes.Key;
+            }
+        }
+
+        public static string GenerateKeyHexString(byte[] key = null)
+        {
+            return BitConverter.ToString(key ?? GenerateKeyBytes()).Replace("-", string.Empty);
+        }
+
+        public static string NewRandomString(int length = 10)
+        {
+            return new string(
+                Enumerable.Repeat('x', length)
+                    .Select(c => Chars[Random.Next(Chars.Length)])
+                    .ToArray());
+        }
+
+        public static Task Await(Func<bool> condition, int timeout = 30 * 1000, int pollingInterval = 50, bool throwWhenDebugging = false, Func<string> userMessageCallback = null)
+        {
+            return Await(() => Task.FromResult(condition()), timeout, pollingInterval, throwWhenDebugging, userMessageCallback);
+        }
+
+        public static async Task Await(Func<Task<bool>> condition, int timeout = 60 * 1000, int pollingInterval = 2 * 1000, bool throwWhenDebugging = false, Func<string> userMessageCallback = null)
         {
             DateTime start = DateTime.Now;
-            while (!condition())
+            while (!await condition())
             {
                 await Task.Delay(pollingInterval);
 
                 bool shouldThrow = !Debugger.IsAttached || (Debugger.IsAttached && throwWhenDebugging);
                 if (shouldThrow && (DateTime.Now - start).TotalMilliseconds > timeout)
                 {
-                    throw new ApplicationException("Condition not reached within timeout.");
+                    string error = "Condition not reached within timeout.";
+                    if (userMessageCallback != null)
+                    {
+                        error += " " + userMessageCallback();
+                    }
+                    throw new ApplicationException(error);
                 }
             }
         }
 
-        public static string RemoveByteOrderMarkAndWhitespace(string s) => Utility.RemoveUtf8ByteOrderMark(s).Trim().Replace(" ", string.Empty);
-
-        public static async Task<string> WaitForBlobAndGetStringAsync(CloudBlockBlob blob)
+        public static async Task<string> WaitForBlobAndGetStringAsync(CloudBlockBlob blob, Func<string> userMessageCallback = null)
         {
-            await WaitForBlobAsync(blob);
+            await WaitForBlobAsync(blob, userMessageCallback: userMessageCallback);
 
             string result = await blob.DownloadTextAsync(Encoding.UTF8,
                 null, new BlobRequestOptions(), new Microsoft.WindowsAzure.Storage.OperationContext());
@@ -58,12 +105,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return result;
         }
 
-        public static async Task WaitForBlobAsync(CloudBlockBlob blob)
+        public static async Task WaitForBlobAsync(CloudBlockBlob blob, Func<string> userMessageCallback = null)
         {
-            await TestHelpers.Await(() =>
+            await TestHelpers.Await(async () =>
             {
-                return blob.Exists();
-            });
+                return await blob.ExistsAsync();
+            }, userMessageCallback: userMessageCallback);
         }
 
         public static void ClearFunctionLogs(string functionName)
@@ -74,6 +121,30 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 foreach (var file in directory.GetFiles())
                 {
                     file.Delete();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Waits until a request sent via the specified HttpClient returns OK or NoContent, indicating
+        /// that the host is ready to invoke functions.
+        /// </summary>
+        /// <param name="client">The HttpClient.</param>
+        public static void WaitForWebHost(HttpClient client)
+        {
+            TestHelpers.Await(() =>
+            {
+                return IsHostRunning(client);
+            }).Wait();
+        }
+
+        private static bool IsHostRunning(HttpClient client)
+        {
+            using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, string.Empty))
+            {
+                using (HttpResponseMessage response = client.SendAsync(request).Result)
+                {
+                    return response.StatusCode == HttpStatusCode.NoContent || response.StatusCode == HttpStatusCode.OK;
                 }
             }
         }
@@ -97,58 +168,38 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
         }
 
-        public static async Task<IList<string>> GetFunctionLogsAsync(string functionName, bool throwOnNoLogs = true)
+        public static IConfiguration GetTestConfiguration()
         {
-            await Task.Delay(FileTraceWriter.LogFlushIntervalMs);
-
-            DirectoryInfo directory = GetFunctionLogFileDirectory(functionName);
-            FileInfo lastLogFile = directory.GetFiles("*.log").OrderByDescending(p => p.LastWriteTime).FirstOrDefault();
-
-            if (lastLogFile != null)
-            {
-                string[] logs = File.ReadAllLines(lastLogFile.FullName);
-                return new Collection<string>(logs.ToList());
-            }
-            else if (throwOnNoLogs)
-            {
-                throw new InvalidOperationException("No logs written!");
-            }
-
-            return new Collection<string>();
-        }
-
-        public static async Task<IList<string>> GetHostLogsAsync(bool throwOnNoLogs = true)
-        {
-            await Task.Delay(FileTraceWriter.LogFlushIntervalMs);
-
-            DirectoryInfo directory = GetHostLogFileDirectory();
-            FileInfo lastLogFile = directory.GetFiles("*.log").OrderByDescending(p => p.LastWriteTime).FirstOrDefault();
-
-            if (lastLogFile != null)
-            {
-                string[] logs = File.ReadAllLines(lastLogFile.FullName);
-                return new Collection<string>(logs.ToList());
-            }
-            else if (throwOnNoLogs)
-            {
-                throw new InvalidOperationException("No logs written!");
-            }
-
-            return new Collection<string>();
+            return new ConfigurationBuilder()
+                    .AddEnvironmentVariables()
+                    .AddTestSettings()
+                    .Build();
         }
 
         // Deleting and recreating a container can result in a 409 as the container name is not
         // immediately available. Instead, use this helper to clear a container.
-        public static void ClearContainer(CloudBlobContainer container)
+        public static async Task ClearContainerAsync(CloudBlobContainer container)
         {
-            foreach (IListBlobItem blobItem in container.ListBlobs())
+            foreach (var blob in await ListBlobsAsync(container))
             {
-                CloudBlockBlob blockBlob = blobItem as CloudBlockBlob;
-                if (blockBlob != null)
-                {
-                    container.GetBlobReference(blockBlob.Name).DeleteIfExists();
-                }
+                await blob.DeleteIfExistsAsync();
             }
+        }
+
+        public static async Task<IEnumerable<CloudBlockBlob>> ListBlobsAsync(CloudBlobContainer container)
+        {
+            List<CloudBlockBlob> blobs = new List<CloudBlockBlob>();
+            BlobContinuationToken token = null;
+
+            do
+            {
+                BlobResultSegment blobSegment = await container.ListBlobsSegmentedAsync(token);
+                token = blobSegment.ContinuationToken;
+                blobs.AddRange(blobSegment.Results.Cast<CloudBlockBlob>());
+            }
+            while (token != null);
+
+            return blobs;
         }
 
         public static DirectoryInfo GetFunctionLogFileDirectory(string functionName)
@@ -163,15 +214,73 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             return new DirectoryInfo(path);
         }
 
-        public static FunctionBinding CreateTestBinding(JObject json)
+        private static async Task<string[]> ReadAllLinesSafeAsync(string logFile)
         {
-            ScriptBindingContext context = new ScriptBindingContext(json);
-            WebJobsCoreScriptBindingProvider provider = new WebJobsCoreScriptBindingProvider(new JobHostConfiguration(), new JObject(), new TestTraceWriter(TraceLevel.Verbose));
-            ScriptBinding scriptBinding = null;
-            provider.TryCreate(context, out scriptBinding);
-            BindingMetadata bindingMetadata = BindingMetadata.Create(json);
-            ScriptHostConfiguration config = new ScriptHostConfiguration();
-            return new ExtensionBinding(config, scriptBinding, bindingMetadata);
+            // ReadAllLines won't work if the file is being written to.
+            // So try a few more times.
+
+            int count = 0;
+            bool success = false;
+            string[] logs = null;
+
+            while (!success && count++ < 3)
+            {
+                try
+                {
+                    logs = File.ReadAllLines(logFile);
+                    success = true;
+                }
+                catch (IOException)
+                {
+                    await Task.Delay(500);
+                }
+            }
+
+            return logs;
+        }
+
+        public static async Task<string> ReadStreamToEnd(Stream stream)
+        {
+            stream.Position = 0;
+            using (var sr = new StreamReader(stream))
+            {
+                return await sr.ReadToEndAsync();
+            }
+        }
+
+        public static IList<WorkerConfig> GetTestWorkerConfigs()
+        {
+            var nodeWorkerDesc = GetTestWorkerDescription("node", ".js");
+            var javaWorkerDesc = GetTestWorkerDescription("java", ".jar");
+
+            return new List<WorkerConfig>()
+            {
+                new WorkerConfig() { Description = nodeWorkerDesc },
+                new WorkerConfig() { Description = javaWorkerDesc },
+            };
+        }
+
+        public static WorkerDescription GetTestWorkerDescription(string language, string extension)
+        {
+            return new WorkerDescription()
+            {
+                Extensions = new List<string>()
+                 {
+                     { extension }
+                 },
+                Language = language
+            };
+        }
+
+        public static IOptionsMonitor<T> CreateOptionsMonitor<T>() where T : class, new()
+        {
+            return CreateOptionsMonitor<T>(new T());
+        }
+
+        public static IOptionsMonitor<T> CreateOptionsMonitor<T>(T options) where T : class, new()
+        {
+            var factory = new TestOptionsFactory<T>(options);
+            return new OptionsMonitor<T>(factory, Array.Empty<IOptionsChangeTokenSource<T>>(), factory);
         }
     }
 }

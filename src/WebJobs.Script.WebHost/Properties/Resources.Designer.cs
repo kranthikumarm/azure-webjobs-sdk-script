@@ -19,7 +19,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Properties {
     // class via a tool like ResGen or Visual Studio.
     // To add or remove a member, edit your .ResX file then rerun ResGen
     // with the /str option, or rebuild your VS project.
-    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "4.0.0.0")]
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "15.0.0.0")]
     [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
     [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
     internal class Resources {
@@ -57,6 +57,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Properties {
             }
             set {
                 resourceCulture = value;
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Two or more function apps are sharing the same secrets ({0}).
+        /// </summary>
+        internal static string ErrorSameSecrets {
+            get {
+                return ResourceManager.GetString("ErrorSameSecrets", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Repository has more than {0} non-decryptable secrets backups ({1}). {2}.
+        /// </summary>
+        internal static string ErrorTooManySecretBackups {
+            get {
+                return ResourceManager.GetString("ErrorTooManySecretBackups", resourceCulture);
             }
         }
         
@@ -107,22 +125,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Properties {
         internal static string FunctionSecretsSchemaV1 {
             get {
                 return ResourceManager.GetString("FunctionSecretsSchemaV1", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to &lt;!DOCTYPE html&gt;
-        ///&lt;html&gt;
-        ///&lt;head&gt;
-        ///    &lt;title&gt;Your Azure Function App is up and running.&lt;/title&gt;
-        ///    &lt;style type=&quot;text/css&quot;&gt;
-        ///        @font-face {
-        ///            font-family: &apos;SegoeLight&apos;;
-        ///            src: url(//:) format(&apos;no404&apos;), url(data:font/woff;charset=utf-8;base64,d09GRgABAAAAAFbcABAAAAAAjewAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAABGRlRNAAABbAAAABsAAAAcWqtaPUdERUYAAAGIAAAAHQAAACABGAADT1MvMgAAAagAAABYAAAAYGrqcLZjbWFwAAACAAAAAaIAAAIKczqUA2N2dCAAAAOkAAAATAAAAEwOEAwRZnBnbQAAA/AAAAGxAAACZQ+0L6dnYXNwAAAFpAAAAAwAAAAMAA [rest of string was truncated]&quot;;.
-        /// </summary>
-        internal static string Homepage {
-            get {
-                return ResourceManager.GetString("Homepage", resourceCulture);
             }
         }
         
@@ -183,38 +185,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Properties {
         }
         
         /// <summary>
-        ///   Looks up a localized string similar to Error deleting Swagger document.
+        ///   Looks up a localized string similar to Starting host specialization.
         /// </summary>
-        internal static string SwaggerFileDeleteError {
+        internal static string HostSpecializationTrace {
             get {
-                return ResourceManager.GetString("SwaggerFileDeleteError", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Error reading Swagger document.
-        /// </summary>
-        internal static string SwaggerFileReadError {
-            get {
-                return ResourceManager.GetString("SwaggerFileReadError", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Error updating Swagger document.
-        /// </summary>
-        internal static string SwaggerFileUpdateError {
-            get {
-                return ResourceManager.GetString("SwaggerFileUpdateError", resourceCulture);
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to Generating Swagger document....
-        /// </summary>
-        internal static string SwaggerGenerateDocument {
-            get {
-                return ResourceManager.GetString("SwaggerGenerateDocument", resourceCulture);
+                return ResourceManager.GetString("HostSpecializationTrace", resourceCulture);
             }
         }
         
@@ -260,6 +235,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Properties {
         internal static string TraceMasterKeyCreatedOrUpdated {
             get {
                 return ResourceManager.GetString("TraceMasterKeyCreatedOrUpdated", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Non-decryptable function (&apos;{0}&apos;) secrets detected. Refreshing secrets..
+        /// </summary>
+        internal static string TraceNonDecryptedFunctionSecretRefresh {
+            get {
+                return ResourceManager.GetString("TraceNonDecryptedFunctionSecretRefresh", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Non-decryptable host secrets detected. Refreshing secrets..
+        /// </summary>
+        internal static string TraceNonDecryptedHostSecretRefresh {
+            get {
+                return ResourceManager.GetString("TraceNonDecryptedHostSecretRefresh", resourceCulture);
             }
         }
         

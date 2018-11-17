@@ -8,7 +8,7 @@
 // </auto-generated>
 //------------------------------------------------------------------------------
 
-namespace Microsoft.Azure.WebJobs.Script.Tests.Properties {
+namespace Microsoft.Azure.WebJobs.Script.Tests.Integration.Properties {
     using System;
     
     
@@ -19,7 +19,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Properties {
     // class via a tool like ResGen or Visual Studio.
     // To add or remove a member, edit your .ResX file then rerun ResGen
     // with the /str option, or rebuild your VS project.
-    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "4.0.0.0")]
+    [global::System.CodeDom.Compiler.GeneratedCodeAttribute("System.Resources.Tools.StronglyTypedResourceBuilder", "15.0.0.0")]
     [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
     [global::System.Runtime.CompilerServices.CompilerGeneratedAttribute()]
     internal class Resources {
@@ -39,7 +39,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Properties {
         internal static global::System.Resources.ResourceManager ResourceManager {
             get {
                 if (object.ReferenceEquals(resourceMan, null)) {
-                    global::System.Resources.ResourceManager temp = new global::System.Resources.ResourceManager("Microsoft.Azure.WebJobs.Script.Tests.Properties.Resources", typeof(Resources).Assembly);
+                    global::System.Resources.ResourceManager temp = new global::System.Resources.ResourceManager("Microsoft.Azure.WebJobs.Script.Tests.Integration.Properties.Resources", typeof(Resources).Assembly);
                     resourceMan = temp;
                 }
                 return resourceMan;
@@ -57,30 +57,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Properties {
             }
             set {
                 resourceCulture = value;
-            }
-        }
-        
-        /// <summary>
-        ///   Looks up a localized string similar to {
-        ///  &quot;status&quot;: &quot;Resolved&quot;,
-        ///  &quot;context&quot;: {
-        ///    &quot;id&quot;: &quot;/subscriptions/&lt;your-subscriptionId&gt;/resourceGroups/functionsWebhooks/providers/microsoft.insights/alertrules/webhooksdemo&quot;,
-        ///    &quot;name&quot;: &quot;webhooksdemo&quot;,
-        ///    &quot;description&quot;: &quot;webhooksdemo&quot;,
-        ///    &quot;conditionType&quot;: &quot;Metric&quot;,
-        ///    &quot;condition&quot;: {
-        ///      &quot;metricName&quot;: &quot;Requests&quot;,
-        ///      &quot;metricUnit&quot;: &quot;Count&quot;,
-        ///      &quot;metricValue&quot;: &quot;1&quot;,
-        ///      &quot;threshold&quot;: &quot;1&quot;,
-        ///      &quot;windowSize&quot;: &quot;5&quot;,
-        ///      &quot;timeAggregation&quot;: &quot;Total&quot;,
-        ///      &quot;operator&quot;: &quot;GreaterThan&quot;
-        ///    } [rest of string was truncated]&quot;;.
-        /// </summary>
-        internal static string AzureWebHookEventRequest {
-            get {
-                return ResourceManager.GetString("AzureWebHookEventRequest", resourceCulture);
             }
         }
         
@@ -111,24 +87,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Properties {
         
         /// <summary>
         ///   Looks up a localized string similar to using System.Net;
-        ///using System.Net.Http;
-        ///using System.Threading.Tasks;
-        ///using Microsoft.Azure.WebJobs.Host;
+        ///using Microsoft.AspNetCore.Mvc;
         ///
         ///namespace TestFunction
         ///{
         ///    public class Function
         ///    {
-        ///        public static Task&lt;HttpResponseMessage&gt; Run(HttpRequestMessage req, TraceWriter log)
+        ///        public static Task&lt;IActionResult&gt; Run(HttpRequest req, ILogger log)
         ///        {
         ///            log.Info(&quot;Test&quot;);
         ///
-        ///            var res = new HttpResponseMessage(HttpStatusCode.OK)
-        ///            {
-        ///                Content = new StringContent(&quot;Hello from .NET&quot;)
-        ///            };
+        ///            return Task.FromResult&lt;IActionResult&gt;(new OkObjectResult(&quot;Hello from .NET&quot;));        
+        ///        }
         ///
-        ///            return Task.FromResult(re [rest of string was truncated]&quot;;.
+        ///        public string OtherMethod()
+        ///        {
+        ///            return &quot;Hello&quot;;
+        ///        }
+        ///
+        ///        private string PrivateMethod()
+        ///        {
+        ///            return &quot;Hel [rest of string was truncated]&quot;;.
         /// </summary>
         internal static string DotNetFunctionSource {
             get {

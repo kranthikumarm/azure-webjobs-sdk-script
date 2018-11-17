@@ -2,19 +2,23 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections.Concurrent;
+using Microsoft.Extensions.Configuration;
 
 namespace Microsoft.Azure.WebJobs.Script.Config
 {
     public class ScriptSettingsManager
     {
         private static ScriptSettingsManager _instance = new ScriptSettingsManager();
-        private readonly ConcurrentDictionary<string, string> _settingsCache = new ConcurrentDictionary<string, string>();
 
-        // for testing
-        public ScriptSettingsManager()
+        public ScriptSettingsManager(IConfiguration config = null)
         {
+            Configuration = config ?? BuildDefaultConfiguration();
         }
+
+        /// <summary>
+        /// Gets the underlying configuration object used by this instance of the <see cref="ScriptSettingsManager"/>.
+        /// </summary>
+        internal IConfiguration Configuration { get;  }
 
         public static ScriptSettingsManager Instance
         {
@@ -22,35 +26,35 @@ namespace Microsoft.Azure.WebJobs.Script.Config
             set { _instance = value; }
         }
 
-        public virtual bool IsAzureEnvironment => !string.IsNullOrEmpty(GetSetting(EnvironmentSettingNames.AzureWebsiteInstanceId));
+        /// <summary>
+        /// Gets a value indicating whether we are running in App Service
+        /// </summary>
+        public virtual bool IsAppServiceEnvironment => !string.IsNullOrEmpty(GetSetting(EnvironmentSettingNames.AzureWebsiteInstanceId));
 
-        public bool IsRemoteDebuggingEnabled => !string.IsNullOrEmpty(GetSetting(EnvironmentSettingNames.RemoteDebuggingPort));
+        public string WebsiteSku => GetSetting(EnvironmentSettingNames.AzureWebsiteSku);
 
-        public bool IsDynamicSku => GetSetting(EnvironmentSettingNames.AzureWebsiteSku) == ScriptConstants.DynamicSku;
+        public bool IsDynamicSku => WebsiteSku == ScriptConstants.DynamicSku;
 
         public virtual string AzureWebsiteDefaultSubdomain
         {
             get
             {
-                return _settingsCache.GetOrAdd(nameof(AzureWebsiteDefaultSubdomain), k =>
+                string siteHostName = GetSetting(EnvironmentSettingNames.AzureWebsiteHostName);
+
+                int? periodIndex = siteHostName?.IndexOf('.');
+                if (periodIndex != null && periodIndex > 0)
                 {
-                    string siteHostName = GetSetting(EnvironmentSettingNames.AzureWebsiteHostName);
+                    return siteHostName.Substring(0, periodIndex.Value);
+                }
 
-                    int? periodIndex = siteHostName?.IndexOf('.');
-
-                    if (periodIndex != null && periodIndex > 0)
-                    {
-                        return siteHostName.Substring(0, periodIndex.Value);
-                    }
-
-                    return null;
-                });
+                return null;
             }
         }
 
         /// <summary>
         /// Gets a value that uniquely identifies the site and slot.
         /// </summary>
+        // TODO: DI (FACAVAL) Remove all usage here. Moved to EnvironmentUtility
         public virtual string AzureWebsiteUniqueSlotName
         {
             get
@@ -68,46 +72,31 @@ namespace Microsoft.Azure.WebJobs.Script.Config
             }
         }
 
+        public virtual string AzureWebsiteInstanceId
+         {
+             get
+             {
+                 string instanceId = GetSetting(EnvironmentSettingNames.AzureWebsiteInstanceId)
+                     ?? Environment.MachineName.GetHashCode().ToString("X").PadLeft(32, '0');
+
+                 return instanceId.Substring(0, Math.Min(instanceId.Length, 32));
+             }
+         }
+
         public virtual string ApplicationInsightsInstrumentationKey
         {
-            get => GetSettingFromCache(EnvironmentSettingNames.AppInsightsInstrumentationKey);
-            set => UpdateSettingInCache(EnvironmentSettingNames.AppInsightsInstrumentationKey, value);
-        }
-
-        private string GetSettingFromCache(string settingKey)
-        {
-            if (string.IsNullOrEmpty(settingKey))
-            {
-                throw new ArgumentNullException(nameof(settingKey));
-            }
-
-            return _settingsCache.GetOrAdd(settingKey, (key) => Utility.GetSettingFromConfigOrEnvironment(key));
-        }
-
-        private void UpdateSettingInCache(string settingKey, string settingValue)
-        {
-            if (string.IsNullOrEmpty(settingKey))
-            {
-                throw new ArgumentNullException(nameof(settingKey));
-            }
-
-            _settingsCache.AddOrUpdate(settingKey, settingValue, (a, b) => settingValue);
-        }
-
-        public virtual void Reset()
-        {
-            _settingsCache.Clear();
+            get => GetSetting(EnvironmentSettingNames.AppInsightsInstrumentationKey);
+            set => SetSetting(EnvironmentSettingNames.AppInsightsInstrumentationKey, value);
         }
 
         public virtual string GetSetting(string settingKey)
         {
-            string settingValue = null;
-            if (!string.IsNullOrEmpty(settingKey))
+            if (string.IsNullOrEmpty(settingKey))
             {
-                settingValue = Environment.GetEnvironmentVariable(settingKey);
+                return null;
             }
 
-            return settingValue;
+            return Configuration[settingKey];
         }
 
         public virtual void SetSetting(string settingKey, string settingValue)
@@ -116,6 +105,18 @@ namespace Microsoft.Azure.WebJobs.Script.Config
             {
                 Environment.SetEnvironmentVariable(settingKey, settingValue);
             }
+        }
+
+        public static IConfiguration BuildDefaultConfiguration()
+        {
+            return CreateDefaultConfigurationBuilder().Build();
+        }
+
+        internal static IConfigurationBuilder CreateDefaultConfigurationBuilder()
+        {
+            return new ConfigurationBuilder()
+                .AddJsonFile("appsettings.json", optional: true)
+                .Add(new ScriptEnvironmentVariablesConfigurationSource());
         }
     }
 }

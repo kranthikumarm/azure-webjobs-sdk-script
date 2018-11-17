@@ -3,7 +3,8 @@
 
 using System.Net.Http;
 using System.Threading.Tasks;
-using Microsoft.Azure.AppService.Proxy.Client.Contract;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Azure.AppService.Proxy.Client;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
@@ -22,9 +23,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return _proxyClient.GetProxyData();
         }
 
-        public async Task Execute(HttpRequestMessage request, ILogger logger)
+        public async Task Execute(HttpRequest request, ILogger logger)
         {
-            await _proxyClient.CallAsync(new object[] { request }, null, logger);
+            request.HttpContext.Items.TryGetValue(ScriptConstants.AzureProxyFunctionExecutorKey, out object proxyFunctionExecutor);
+            await _proxyClient.CallAsync(new object[] { request }, proxyFunctionExecutor as IFuncExecutor, logger);
         }
     }
 }

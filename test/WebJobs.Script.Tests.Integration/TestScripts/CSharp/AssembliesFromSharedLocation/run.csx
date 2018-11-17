@@ -1,8 +1,9 @@
 ﻿#r "..\SharedAssemblies\PrimaryDependency.dll"
 
 using PrimaryDependency;
+using Microsoft.AspNetCore.Mvc;
 
-public static void Run(HttpRequestMessage req, TraceWriter log)
+public static IActionResult Run(HttpRequest req, TraceWriter log)
 {
-    req.Properties["DependencyOutput"] = new Primary().GetValue();
+    return new OkObjectResult(new Primary().GetValue());
 }

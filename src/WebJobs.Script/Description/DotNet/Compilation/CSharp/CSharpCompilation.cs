@@ -9,6 +9,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Description.DotNet.CSharp.Analyzers;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -37,7 +38,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return _compilation.WithAnalyzers(GetAnalyzers()).GetAllDiagnosticsAsync().Result;
         }
 
-        public FunctionSignature GetEntryPointSignature(IFunctionEntryPointResolver entryPointResolver)
+        public FunctionSignature GetEntryPointSignature(IFunctionEntryPointResolver entryPointResolver, Assembly functionAssembly)
         {
             if (!_compilation.SyntaxTrees.Any())
             {
@@ -87,9 +88,9 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 && namedTypeSymbol.TypeArguments.Any(t => IsOrUsesAssemblyType(t, assemblySymbol));
         }
 
-        object ICompilation.Emit(CancellationToken cancellationToken) => Emit(cancellationToken);
+        async Task<object> ICompilation.EmitAsync(CancellationToken cancellationToken) => await EmitAsync(cancellationToken);
 
-        public Assembly Emit(CancellationToken cancellationToken)
+        public async Task<DotNetCompilationResult> EmitAsync(CancellationToken cancellationToken)
         {
             try
             {
@@ -97,8 +98,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 using (var pdbStream = new MemoryStream())
                 {
                     var compilationWithAnalyzers = _compilation.WithAnalyzers(GetAnalyzers());
-                    var diagnostics = compilationWithAnalyzers.GetAnalyzerDiagnosticsAsync().Result;
-                    var emitOptions = new EmitOptions().WithDebugInformationFormat(PlatformHelper.IsMono ? DebugInformationFormat.PortablePdb : DebugInformationFormat.Pdb);
+                    var diagnostics = await compilationWithAnalyzers.GetAnalyzerDiagnosticsAsync();
+                    var emitOptions = new EmitOptions().WithDebugInformationFormat(PlatformHelper.IsWindows ? DebugInformationFormat.Pdb : DebugInformationFormat.PortablePdb);
                     var emitResult = compilationWithAnalyzers.Compilation.Emit(assemblyStream, pdbStream, options: emitOptions, cancellationToken: cancellationToken);
 
                     diagnostics = diagnostics.AddRange(emitResult.Diagnostics);
@@ -112,7 +113,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                     // and if so quit here.
                     cancellationToken.ThrowIfCancellationRequested();
 
-                    return Assembly.Load(assemblyStream.GetBuffer(), pdbStream.GetBuffer());
+                    return DotNetCompilationResult.FromBytes(assemblyStream.GetBuffer(), pdbStream.GetBuffer());
                 }
             }
             catch (Exception exc) when (!(exc is CompilationErrorException))

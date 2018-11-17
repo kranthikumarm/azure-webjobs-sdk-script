@@ -3,56 +3,85 @@
 
 using System;
 using System.Collections.Generic;
-using System.Configuration;
-using System.Diagnostics;
+using System.Collections.ObjectModel;
 using System.Dynamic;
 using System.Globalization;
+using System.IO;
+using System.IO.Abstractions;
 using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host;
-using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Rpc;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
 using Newtonsoft.Json.Linq;
+using FunctionMetadata = Microsoft.Azure.WebJobs.Script.Description.FunctionMetadata;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
     public static class Utility
     {
-        private static readonly string UTF8ByteOrderMark = Encoding.UTF8.GetString(Encoding.UTF8.GetPreamble());
-        public const string AzureWebsiteSku = "WEBSITE_SKU";
-        public const string DynamicSku = "Dynamic";
-        private static readonly FilteredExpandoObjectConverter _filteredExpandoObjectConverter = new FilteredExpandoObjectConverter();
+        // Prefix that uniquely identifies our assemblies
+        // i.e.: "f-<functionname>"
+        public const string AssemblyPrefix = "f-";
+        public const string AssemblySeparator = "__";
 
-        /// <summary>
-        /// Gets a value indicating whether the JobHost is running in a Dynamic
-        /// App Service WebApp.
-        /// </summary>
-        public static bool IsDynamic
+        private static readonly string UTF8ByteOrderMark = Encoding.UTF8.GetString(Encoding.UTF8.GetPreamble());
+        private static readonly FilteredExpandoObjectConverter _filteredExpandoObjectConverter = new FilteredExpandoObjectConverter();
+        private static List<string> dotNetLanguages = new List<string>() { DotNetScriptTypes.CSharp, DotNetScriptTypes.DotNetAssembly };
+
+        internal static async Task InvokeWithRetriesAsync(Action action, int maxRetries, TimeSpan retryInterval)
         {
-            get
+            await InvokeWithRetriesAsync(() =>
             {
-                string value = GetSettingFromConfigOrEnvironment(AzureWebsiteSku);
-                return string.Compare(value, DynamicSku, StringComparison.OrdinalIgnoreCase) == 0;
+                action();
+                return Task.CompletedTask;
+            }, maxRetries, retryInterval);
+        }
+
+        internal static async Task InvokeWithRetriesAsync(Func<Task> action, int maxRetries, TimeSpan retryInterval)
+        {
+            int attempt = 0;
+            while (true)
+            {
+                try
+                {
+                    await action();
+                    return;
+                }
+                catch (Exception ex) when (!ex.IsFatal())
+                {
+                    if (++attempt > maxRetries)
+                    {
+                        throw;
+                    }
+                    await Task.Delay(retryInterval);
+                }
             }
         }
 
-        public static string GetSettingFromConfigOrEnvironment(string settingName)
+        /// <summary>
+        /// Delays while the specified condition remains true.
+        /// </summary>
+        /// <param name="timeoutSeconds">The maximum number of seconds to delay.</param>
+        /// <param name="pollingIntervalMilliseconds">The polling interval.</param>
+        /// <param name="condition">The condition to check</param>
+        /// <returns>A Task representing the delay.</returns>
+        internal static async Task DelayAsync(int timeoutSeconds, int pollingIntervalMilliseconds, Func<bool> condition)
         {
-            string configValue = ConfigurationManager.AppSettings[settingName];
+            TimeSpan timeout = TimeSpan.FromSeconds(timeoutSeconds);
+            TimeSpan delay = TimeSpan.FromMilliseconds(pollingIntervalMilliseconds);
+            TimeSpan timeWaited = TimeSpan.Zero;
 
-            // Empty strings are allowed. Null indicates that the setting was not found.
-            if (configValue != null)
+            while (condition() && (timeWaited < timeout))
             {
-                // config values take precedence over environment values
-                return configValue;
+                await Task.Delay(delay);
+                timeWaited += delay;
             }
-
-            return Environment.GetEnvironmentVariable(settingName) ?? configValue;
         }
 
         /// <summary>
@@ -108,20 +137,8 @@ namespace Microsoft.Azure.WebJobs.Script
             return delay;
         }
 
-        public static string GetSubscriptionId()
-        {
-            string ownerName = ScriptSettingsManager.Instance.GetSetting(EnvironmentSettingNames.AzureWebsiteOwnerName) ?? string.Empty;
-            if (!string.IsNullOrEmpty(ownerName))
-            {
-                int idx = ownerName.IndexOf('+');
-                if (idx > 0)
-                {
-                    return ownerName.Substring(0, idx);
-                }
-            }
-
-            return null;
-        }
+        public static string GetInformationalVersion(Type type)
+            => type.Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? string.Empty;
 
         public static bool IsValidUserType(Type type)
         {
@@ -151,44 +168,6 @@ namespace Microsoft.Azure.WebJobs.Script
             int i = fullFunctionName.LastIndexOf('.');
             var typeName = fullFunctionName.Substring(0, i);
             return typeName;
-        }
-
-        internal static string GetDefaultHostId(ScriptSettingsManager settingsManager, ScriptHostConfiguration scriptConfig)
-        {
-            // We're setting the default here on the newly created configuration
-            // If the user has explicitly set the HostID via host.json, it will overwrite
-            // what we set here
-            string hostId = null;
-            if (scriptConfig.IsSelfHost)
-            {
-                // When running locally, derive a stable host ID from machine name
-                // and root path. We use a hash rather than the path itself to ensure
-                // IDs differ (due to truncation) between folders that may share the same
-                // root path prefix.
-                // Note that such an ID won't work in distributed scenarios, so should
-                // only be used for local/CLI scenarios.
-                string sanitizedMachineName = Environment.MachineName
-                    .Where(char.IsLetterOrDigit)
-                    .Aggregate(new StringBuilder(), (b, c) => b.Append(c)).ToString();
-                hostId = $"{sanitizedMachineName}-{Math.Abs(scriptConfig.RootScriptPath.GetHashCode())}";
-            }
-            else if (!string.IsNullOrEmpty(settingsManager.AzureWebsiteUniqueSlotName))
-            {
-                // If running on Azure Web App, derive the host ID from unique site slot name
-                hostId = settingsManager.AzureWebsiteUniqueSlotName;
-            }
-
-            if (!string.IsNullOrEmpty(hostId))
-            {
-                if (hostId.Length > ScriptConstants.MaximumHostIdLength)
-                {
-                    // Truncate to the max host name length if needed
-                    hostId = hostId.Substring(0, ScriptConstants.MaximumHostIdLength);
-                }
-            }
-
-            // Lowercase and trim any trailing '-' as they can cause problems with queue names
-            return hostId?.ToLowerInvariant().TrimEnd('-');
         }
 
         public static string FlattenException(Exception ex, Func<string, string> sourceFormatter = null, bool includeSource = true)
@@ -343,45 +322,166 @@ namespace Microsoft.Azure.WebJobs.Script
             return JObject.Parse(json);
         }
 
-        public static bool TryMatchAssembly(string assemblyName, Type type, out Assembly matchedAssembly)
-        {
-            matchedAssembly = null;
-
-            var candidateAssembly = type.Assembly;
-            if (string.Compare(assemblyName, candidateAssembly.GetName().Name, StringComparison.OrdinalIgnoreCase) == 0)
-            {
-                matchedAssembly = candidateAssembly;
-                return true;
-            }
-
-            return false;
-        }
-
-        public static IJobHostMetadataProvider CreateMetadataProvider(this JobHost host)
-        {
-            return (IJobHostMetadataProvider)host.Services.GetService(typeof(IJobHostMetadataProvider));
-        }
-
         internal static bool IsNullable(Type type)
         {
             return type.IsGenericType && type.GetGenericTypeDefinition() == typeof(Nullable<>);
         }
 
-        internal static LogLevel ToLogLevel(TraceLevel traceLevel)
+        internal static LogLevel ToLogLevel(System.Diagnostics.TraceLevel traceLevel)
         {
             switch (traceLevel)
             {
-                case TraceLevel.Verbose:
+                case System.Diagnostics.TraceLevel.Verbose:
                     return LogLevel.Trace;
-                case TraceLevel.Info:
+                case System.Diagnostics.TraceLevel.Info:
                     return LogLevel.Information;
-                case TraceLevel.Warning:
+                case System.Diagnostics.TraceLevel.Warning:
                     return LogLevel.Warning;
-                case TraceLevel.Error:
+                case System.Diagnostics.TraceLevel.Error:
                     return LogLevel.Error;
                 default:
                     return LogLevel.None;
             }
+        }
+
+        public static bool GetStateBoolValue(IEnumerable<KeyValuePair<string, object>> state, string key)
+        {
+            if (state == null)
+            {
+                return false;
+            }
+
+            var kvps = state.Where(k => string.Equals(k.Key, key, StringComparison.OrdinalIgnoreCase));
+
+            if (!kvps.Any())
+            {
+                return false;
+            }
+
+            // Choose the last one rather than throwing for multiple hits. Since we use our own keys to track
+            // this, we shouldn't have conflicts.
+            return Convert.ToBoolean(kvps.Last().Value);
+        }
+
+        public static TValue GetStateValueOrDefault<TValue>(IEnumerable<KeyValuePair<string, object>> state, string key)
+        {
+            if (state == null)
+            {
+                return default(TValue);
+            }
+
+            var kvps = state.Where(k => string.Equals(k.Key, key, StringComparison.OrdinalIgnoreCase));
+
+            if (!kvps.Any())
+            {
+                return default(TValue);
+            }
+
+            // Choose the last one rather than throwing for multiple hits. Since we use our own keys to track
+            // this, we shouldn't have conflicts.
+            return (TValue)kvps.Last().Value;
+        }
+
+        public static string GetValueFromState<TState>(TState state, string key)
+        {
+            string value = string.Empty;
+            if (state is IEnumerable<KeyValuePair<string, object>> stateDict)
+            {
+                value = GetStateValueOrDefault<string>(stateDict, key) ?? string.Empty;
+            }
+            return value;
+        }
+
+        public static string GetValueFromScope(IDictionary<string, object> scopeProperties, string key)
+        {
+            if (scopeProperties != null && scopeProperties.TryGetValue(key, out object value) && value != null)
+            {
+                return value.ToString();
+            }
+            return null;
+        }
+
+        public static string GetAssemblyNameFromMetadata(Description.FunctionMetadata metadata, string suffix)
+        {
+            return AssemblyPrefix + metadata.Name + AssemblySeparator + suffix.GetHashCode().ToString();
+        }
+
+        internal static void AddFunctionError(IDictionary<string, ICollection<string>> functionErrors, string functionName, string error, bool isFunctionShortName = false)
+        {
+            functionName = isFunctionShortName ? functionName : Utility.GetFunctionShortName(functionName);
+
+            ICollection<string> functionErrorCollection = new Collection<string>();
+            if (!functionErrors.TryGetValue(functionName, out functionErrorCollection))
+            {
+                functionErrors[functionName] = functionErrorCollection = new Collection<string>();
+            }
+            functionErrorCollection.Add(error);
+        }
+
+        internal static bool TryReadFunctionConfig(string scriptDir, out string json, IFileSystem fileSystem = null)
+        {
+            json = null;
+            fileSystem = fileSystem ?? FileUtility.Instance;
+
+            // read the function config
+            string functionConfigPath = Path.Combine(scriptDir, ScriptConstants.FunctionMetadataFileName);
+            try
+            {
+                json = fileSystem.File.ReadAllText(functionConfigPath);
+            }
+            catch (IOException ex) when
+                (ex is FileNotFoundException || ex is DirectoryNotFoundException)
+            {
+                // not a function directory
+                return false;
+            }
+
+            return true;
+        }
+
+        internal static bool IsSingleLanguage(IEnumerable<FunctionMetadata> functions, string language)
+        {
+            if (string.IsNullOrEmpty(language))
+            {
+                if (functions != null && functions.Any())
+                {
+                    var functionsListWithoutProxies = functions.Where(f => f.IsProxy == false);
+                    return functionsListWithoutProxies.Select(f => f.Language).Distinct().Count() <= 1;
+                }
+            }
+            return true;
+        }
+
+        internal static bool ShouldInitiliazeLanguageWorkers(IEnumerable<FunctionMetadata> functions, string currentRuntimeLanguage)
+        {
+            if (!string.IsNullOrEmpty(currentRuntimeLanguage) && currentRuntimeLanguage.Equals(LanguageWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+            var functionsListWithoutProxies = functions?.Where(f => f.IsProxy == false);
+            if (!string.IsNullOrEmpty(currentRuntimeLanguage) && ContainsFunctionWithCurrentLanguage(functionsListWithoutProxies, currentRuntimeLanguage))
+            {
+                return true;
+            }
+            return ContainsNonDotNetFunctions(functionsListWithoutProxies);
+        }
+
+        private static bool ContainsNonDotNetFunctions(IEnumerable<FunctionMetadata> functions)
+        {
+            if (functions != null && functions.Any())
+            {
+                return functions.Any(f => !dotNetLanguages.Contains(f.Language, StringComparer.OrdinalIgnoreCase));
+            }
+            return false;
+        }
+
+        private static bool ContainsFunctionWithCurrentLanguage(IEnumerable<FunctionMetadata> functions, string currentLanguage)
+        {
+            if (functions != null && functions.Any())
+            {
+                return functions.Any(f => f.Language.Equals(currentLanguage, StringComparison.OrdinalIgnoreCase));
+            }
+            return false;
         }
 
         private class FilteredExpandoObjectConverter : ExpandoObjectConverter

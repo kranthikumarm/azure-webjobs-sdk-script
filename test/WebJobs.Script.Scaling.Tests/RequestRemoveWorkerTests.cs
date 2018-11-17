@@ -11,7 +11,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
 {
     public class RequestRemoveWorkerTests
     {
-        [Theory, MemberData("BasicData")]
+        [Theory, MemberData(nameof(BasicData))]
         public async Task BasicTests(IWorkerInfo manager, IWorkerInfo toRemove)
         {
             var activityId = Guid.NewGuid().ToString();
@@ -20,7 +20,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             using (var scaleManager = new MockScaleManager(MockBehavior.Strict))
             {
                 scaleManager.MockScaleHandler.Setup(s => s.RemoveWorker(activityId, toRemove))
-                    .Returns(Task.CompletedTask);
+                    .Returns(Task.FromResult(true));
                 scaleManager.MockWorkerTable.Setup(t => t.Delete(toRemove))
                     .Returns(Task.CompletedTask);
                 scaleManager.MockScaleTracer.Setup(t => t.TraceRemoveWorker(activityId, toRemove, It.Is<string>(s => s.Contains(manager.ToDisplayString()))));

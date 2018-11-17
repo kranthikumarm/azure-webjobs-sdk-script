@@ -2,57 +2,59 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Reflection;
+using System.Runtime.Loader;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Newtonsoft.Json.Linq;
 
 namespace Microsoft.Azure.WebJobs.Script.Binding
 {
-    // This single binder can service all SDK extensions by leveraging the SDK metadata provider.
+    /// <summary>
+    /// This general purpose binder can service all SDK extensions by leveraging the SDK metadata provider.
+    /// This should eventually replace all other ScriptBindingProviders.
+    /// </summary>
     internal class GeneralScriptBindingProvider : ScriptBindingProvider
     {
         private IJobHostMetadataProvider _metadataProvider;
 
-        public GeneralScriptBindingProvider(
-            JobHostConfiguration config,
-            JObject hostMetadata,
-            TraceWriter traceWriter)
-            : base(config, hostMetadata, traceWriter)
+        public GeneralScriptBindingProvider(ILogger<GeneralScriptBindingProvider> logger, IJobHostMetadataProvider metadataProvider)
+            : base(logger)
         {
-        }
-
-        // The constructor is fixed and ScriptBindingProvider are instantated for us by the Script runtime.
-        // Extensions may get registered after this class is instantiated.
-        // So we need a final call that lets us get the tooling snapshot of the graph after all extensions are set.
-        public void CompleteInitialization(IJobHostMetadataProvider metadataProvider)
-        {
-            this._metadataProvider = metadataProvider;
+            _metadataProvider = metadataProvider;
         }
 
         public override bool TryCreate(ScriptBindingContext context, out ScriptBinding binding)
         {
             string name = context.Type;
-            var attrType = this._metadataProvider.GetAttributeTypeFromName(name);
+            var attrType = _metadataProvider?.GetAttributeTypeFromName(name);
             if (attrType == null)
             {
                 binding = null;
                 return false;
             }
 
-            var attr = this._metadataProvider.GetAttribute(attrType, context.Metadata);
+            try
+            {
+                var attr = _metadataProvider.GetAttribute(attrType, context.Metadata);
+                binding = new GeneralScriptBinding(_metadataProvider, attr, context);
+            }
+            catch (Exception e)
+            {
+                throw new Exception($"Unable to configure binding '{context.Name}' of type '{name}'. This may indicate invalid function.json properties", e);
+            }
 
-            binding = new GeneralScriptBinding(this._metadataProvider, attr, context);
             return true;
         }
 
-        public override bool TryResolveAssembly(string assemblyName, out Assembly assembly)
+        public override bool TryResolveAssembly(string assemblyName, AssemblyLoadContext targetContext, out Assembly assembly)
         {
-            return this._metadataProvider.TryResolveAssembly(assemblyName, out assembly);
+            return _metadataProvider.TryResolveAssembly(assemblyName, out assembly);
         }
 
         // Function.json specifies a type via optional DataType and Cardinality properties.
@@ -99,22 +101,18 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
             return typeof(object);
         }
 
-        private class GeneralScriptBinding : ScriptBinding, IResultProcessingBinding
+        private class GeneralScriptBinding : ScriptBinding
         {
             private readonly Attribute _attribute;
             private readonly IJobHostMetadataProvider _metadataProvider;
 
             private Type _defaultType;
 
-            private MethodInfo _applyReturn; // Action<object,object>
-
             public GeneralScriptBinding(IJobHostMetadataProvider metadataProvider, Attribute attribute, ScriptBindingContext context)
                 : base(context)
             {
                 _metadataProvider = metadataProvider;
                 _attribute = attribute;
-
-                _applyReturn = attribute.GetType().GetMethod("ApplyReturn", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
             }
 
             // This should only be called in script scenarios (not C#).
@@ -125,33 +123,10 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                 {
                     if (_defaultType == null)
                     {
-                        Type requestedType = GetRequestedType(this.Context);
-                        _defaultType = _metadataProvider.GetDefaultType(_attribute, this.Context.Access, requestedType);
+                        Type requestedType = GetRequestedType(Context);
+                        _defaultType = _metadataProvider.GetDefaultType(_attribute, Context.Access, requestedType);
                     }
                     return _defaultType;
-                }
-            }
-
-            public bool CanProcessResult(object result)
-            {
-                return _applyReturn != null;
-            }
-
-            public void ProcessResult(
-                IDictionary<string, object> functionArguments,
-                object[] systemArguments,
-                string triggerInputName,
-                object result)
-            {
-                if (result == null)
-                {
-                    return;
-                }
-
-                object context;
-                if (functionArguments.TryGetValue(triggerInputName, out context))
-                {
-                    _applyReturn.Invoke(null, new object[] { context, result });
                 }
             }
 

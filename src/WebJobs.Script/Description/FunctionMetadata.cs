@@ -34,7 +34,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         /// </summary>
         public string EntryPoint { get; set; }
 
-        public ScriptType ScriptType { get; set; }
+        public string Language { get; set; }
 
         /// <summary>
         /// Gets or sets a value indicating whether the function is disabled.
@@ -46,18 +46,11 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         public bool IsDisabled { get; set; }
 
         /// <summary>
-        /// Gets or sets a value indicating whether the function is excluded.
-        /// <remarks>
-        /// An excluded function is completely skipped during function loading. It will not be compiled
-        /// and will not be loaded into the host.
-        /// </remarks>
-        /// </summary>
-        public bool IsExcluded { get; set; }
-
-        /// <summary>
         /// Gets or sets a value indicating whether that this function is a direct invoke.
         /// </summary>
         public bool IsDirect { get; set; }
+
+        public string FunctionId { get; set; } = Guid.NewGuid().ToString();
 
         /// <summary>
         /// Gets or sets a value indicating whether this function is a wrapper for Azure Function Proxy

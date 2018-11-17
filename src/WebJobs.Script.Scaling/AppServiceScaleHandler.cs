@@ -10,6 +10,7 @@ using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Net.Security;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
@@ -36,7 +37,8 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling
         {
             var assembly = typeof(AppServiceScaleHandler).Assembly;
             var fvi = FileVersionInfo.GetVersionInfo(assembly.Location);
-            return new ProductInfoHeaderValue("ScaleManager", fvi.ProductVersion);
+            var version = new Version(fvi.ProductMajorPart, fvi.ProductMinorPart, fvi.ProductBuildPart).ToString();
+            return new ProductInfoHeaderValue("ScaleManager", version);
         });
 
         private static string _token;
@@ -175,7 +177,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling
         /// - FE should return success regardless if worker belongs.
         /// - Any unexpected error will throw.
         /// </summary>
-        public async Task RemoveWorker(string activityId, IWorkerInfo worker)
+        public async Task<bool> RemoveWorker(string activityId, IWorkerInfo worker)
         {
             var stampHostName = GetStampHostName(worker.StampName);
             var details = string.Format("Remove worker request from {0}:{1}", AppServiceSettings.CurrentStampName, AppServiceSettings.WorkerName);
@@ -187,7 +189,13 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling
 
             using (var response = await SendAsync(activityId, HttpMethod.Delete, pathAndQuery, worker, details))
             {
+                if (response.StatusCode == HttpStatusCode.NotModified)
+                {
+                    return false;
+                }
+
                 response.EnsureSuccessStatusCode();
+                return true;
             }
         }
 
@@ -231,13 +239,20 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling
                 var handler = _httpMessageHandler;
                 if (handler == null)
                 {
-                    var webHandler = new WebRequestHandler();
-                    if (!AppServiceSettings.ValidateCertificates.Value)
+                    if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                     {
-                        webHandler.ServerCertificateValidationCallback = ServerCertificateValidation;
-                    }
+                        var webHandler = new WinHttpHandler();
+                        if (!AppServiceSettings.ValidateCertificates.Value)
+                        {
+                            webHandler.ServerCertificateValidationCallback = ServerCertificateValidation;
+                        }
 
-                    handler = webHandler;
+                        handler = webHandler;
+                    }
+                    else
+                    {
+                        handler = new HttpClientHandler();
+                    }
                 }
 
                 var client = new HttpClient(new HttpLoggingHandler(handler));

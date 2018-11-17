@@ -20,11 +20,11 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
 {
     public abstract class FunctionBinding
     {
-        private readonly ScriptHostConfiguration _config;
+        private readonly ScriptJobHostOptions _options;
 
-        protected FunctionBinding(ScriptHostConfiguration config, BindingMetadata metadata, FileAccess access)
+        protected FunctionBinding(ScriptJobHostOptions options, BindingMetadata metadata, FileAccess access)
         {
-            _config = config;
+            _options = options;
             Access = access;
             Metadata = metadata;
         }
@@ -37,15 +37,16 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
 
         public abstract Collection<CustomAttributeBuilder> GetCustomAttributes(Type parameterType);
 
-        internal static Collection<FunctionBinding> GetBindings(ScriptHostConfiguration config, IEnumerable<BindingMetadata> functions, FileAccess fileAccess)
+        internal static Collection<FunctionBinding> GetBindings(ScriptJobHostOptions config, IEnumerable<IScriptBindingProvider> bindingProviders,
+            IEnumerable<BindingMetadata> bindingMetadataCollection, FileAccess fileAccess)
         {
             Collection<FunctionBinding> bindings = new Collection<FunctionBinding>();
 
             if (bindings != null)
             {
-                foreach (var function in functions)
+                foreach (var bindingMetadata in bindingMetadataCollection)
                 {
-                    string type = function.Type.ToLowerInvariant();
+                    string type = bindingMetadata.Type.ToLowerInvariant();
                     switch (type)
                     {
                         case "http":
@@ -53,11 +54,11 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                             {
                                 throw new InvalidOperationException("Http binding can only be used for output.");
                             }
-                            bindings.Add(new HttpBinding(config, function, FileAccess.Write));
+                            bindings.Add(new HttpBinding(config, bindingMetadata, FileAccess.Write));
                             break;
                         default:
                             FunctionBinding binding = null;
-                            if (TryParseFunctionBinding(config, function.Raw, out binding))
+                            if (TryParseFunctionBinding(config, bindingProviders, bindingMetadata.Raw, out binding))
                             {
                                 bindings.Add(binding);
                             }
@@ -69,13 +70,13 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
             return bindings;
         }
 
-        private static bool TryParseFunctionBinding(ScriptHostConfiguration config, JObject metadata, out FunctionBinding functionBinding)
+        private static bool TryParseFunctionBinding(ScriptJobHostOptions config, IEnumerable<IScriptBindingProvider> bindingProviders, JObject metadata, out FunctionBinding functionBinding)
         {
             functionBinding = null;
 
             ScriptBindingContext bindingContext = new ScriptBindingContext(metadata);
             ScriptBinding scriptBinding = null;
-            foreach (var provider in config.BindingProviders)
+            foreach (var provider in bindingProviders)
             {
                 if (provider.TryCreate(bindingContext, out scriptBinding))
                 {
@@ -94,19 +95,14 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
             return true;
         }
 
-        protected string Resolve(string name)
-        {
-            if (_config.HostConfig.NameResolver == null)
-            {
-                return name;
-            }
-
-            return _config.HostConfig.NameResolver.ResolveWholeString(name);
-        }
-
         internal static IEnumerable ReadAsEnumerable(object value)
         {
             IEnumerable values = null;
+
+            if (value is JArray jArray)
+            {
+                return jArray;
+            }
 
             if (value is Stream)
             {
@@ -263,6 +259,11 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
                 {
                     bytes = BitConverter.GetBytes((int)value);
                 }
+                else if (type == typeof(long))
+                {
+                    int val = unchecked((int)((long)value));
+                    bytes = BitConverter.GetBytes(val);
+                }
                 else if (type == typeof(bool))
                 {
                     bytes = BitConverter.GetBytes((bool)value);
@@ -297,6 +298,11 @@ namespace Microsoft.Azure.WebJobs.Script.Binding
 
         public static void ConvertStreamToValue(Stream stream, DataType dataType, ref object converted)
         {
+            if (stream == null)
+            {
+                return;
+            }
+
             switch (dataType)
             {
                 case DataType.String:

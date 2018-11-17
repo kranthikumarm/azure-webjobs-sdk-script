@@ -6,30 +6,36 @@ using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Linq;
-using System.Net.Http;
 using System.Reflection;
 using System.Reflection.Emit;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Microsoft.CodeAnalysis.Scripting;
+using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
 {
     internal sealed class DotNetFunctionDescriptorProvider : FunctionDescriptorProvider, IDisposable
     {
-        private readonly FunctionAssemblyLoader _assemblyLoader;
+        private readonly IMetricsLogger _metricsLogger;
+        private readonly ILoggerFactory _loggerFactory;
         private readonly ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver> _compilationServiceFactory;
+        private static readonly Lazy<Regex> _taskOfUnitType = new Lazy<Regex>(() => new Regex(@"^System\.Threading\.Tasks\.Task`1\[\[Microsoft\.FSharp\.Core\.Unit, FSharp\.Core, Version=\d*\.\d*\.\d*\.\d*, Culture=.*, PublicKeyToken=b03f5f7f11d50a3a\]\]$", RegexOptions.Compiled));
 
-        public DotNetFunctionDescriptorProvider(ScriptHost host, ScriptHostConfiguration config)
-           : this(host, config, new DotNetCompilationServiceFactory(host.TraceWriter, config.HostConfig.LoggerFactory))
+        public DotNetFunctionDescriptorProvider(ScriptHost host, ScriptJobHostOptions config, ICollection<IScriptBindingProvider> bindingProviders, IMetricsLogger metricsLogger, ILoggerFactory loggerFactory)
+           : this(host, config, bindingProviders, new DotNetCompilationServiceFactory(loggerFactory), metricsLogger, loggerFactory)
         {
         }
 
-        public DotNetFunctionDescriptorProvider(ScriptHost host, ScriptHostConfiguration config,
-            ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver> compilationServiceFactory)
-            : base(host, config)
+        public DotNetFunctionDescriptorProvider(ScriptHost host, ScriptJobHostOptions config, ICollection<IScriptBindingProvider> bindingProviders,
+            ICompilationServiceFactory<ICompilationService<IDotNetCompilation>, IFunctionMetadataResolver> compilationServiceFactory, IMetricsLogger metricsLogger, ILoggerFactory loggerFactory)
+            : base(host, config, bindingProviders)
         {
-            _assemblyLoader = new FunctionAssemblyLoader(config.RootScriptPath);
+            _metricsLogger = metricsLogger;
+            _loggerFactory = loggerFactory;
             _compilationServiceFactory = compilationServiceFactory;
         }
 
@@ -42,34 +48,39 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         {
             if (disposing)
             {
-                _assemblyLoader.Dispose();
             }
         }
 
-        public override bool TryCreate(FunctionMetadata functionMetadata, out FunctionDescriptor functionDescriptor)
+        public override async Task<(bool, FunctionDescriptor)> TryCreate(FunctionMetadata functionMetadata)
         {
             if (functionMetadata == null)
             {
                 throw new ArgumentNullException("functionMetadata");
             }
 
-            functionDescriptor = null;
-
             // We can only handle script types supported by the current compilation service factory
-            if (!_compilationServiceFactory.SupportedScriptTypes.Contains(functionMetadata.ScriptType))
+            if (!_compilationServiceFactory.SupportedLanguages.Contains(functionMetadata.Language))
             {
-                return false;
+                return (false, null);
             }
 
-            return base.TryCreate(functionMetadata, out functionDescriptor);
+            return await base.TryCreate(functionMetadata);
         }
 
         protected override IFunctionInvoker CreateFunctionInvoker(string scriptFilePath, BindingMetadata triggerMetadata, FunctionMetadata functionMetadata, Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
         {
-            return new DotNetFunctionInvoker(Host, functionMetadata, inputBindings, outputBindings, new FunctionEntryPointResolver(functionMetadata.EntryPoint), _assemblyLoader, _compilationServiceFactory);
+            return new DotNetFunctionInvoker(Host,
+                functionMetadata,
+                inputBindings,
+                outputBindings,
+                new FunctionEntryPointResolver(functionMetadata.EntryPoint),
+                _compilationServiceFactory,
+                _loggerFactory,
+                _metricsLogger,
+                BindingProviders);
         }
 
-        protected override Collection<ParameterDescriptor> GetFunctionParameters(IFunctionInvoker functionInvoker, FunctionMetadata functionMetadata,
+        protected override async Task<Collection<ParameterDescriptor>> GetFunctionParametersAsync(IFunctionInvoker functionInvoker, FunctionMetadata functionMetadata,
             BindingMetadata triggerMetadata, Collection<CustomAttributeBuilder> methodAttributes, Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
         {
             if (functionInvoker == null)
@@ -99,7 +110,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             {
                 ApplyMethodLevelAttributes(functionMetadata, triggerMetadata, methodAttributes);
 
-                MethodInfo functionTarget = dotNetInvoker.GetFunctionTargetAsync().Result;
+                MethodInfo functionTarget = await dotNetInvoker.GetFunctionTargetAsync();
                 ParameterInfo[] parameters = functionTarget.GetParameters();
                 Collection<ParameterDescriptor> descriptors = new Collection<ParameterDescriptor>();
                 IEnumerable<FunctionBinding> bindings = inputBindings.Union(outputBindings);
@@ -135,12 +146,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                             }
                         }
 
-                        // In the C# programming model, IsOut is set for out parameters
-                        // In the F# programming model, neither IsOut nor IsIn are set for byref parameters (which are used as out parameters).
-                        //   Justification for this cariation of the programming model is that declaring 'out' parameters is (deliberately)
-                        //   awkward in F#, they require opening System.Runtime.InteropServices and adding the [<Out>] attribute, and using
-                        //   a byref parameter. In contrast declaring a byref parameter alone (neither labelled In nor Out) is simple enough.
-                        if (parameter.IsOut || (functionMetadata.ScriptType == ScriptType.FSharp && parameterIsByRef && !parameter.IsIn))
+                        if (parameter.IsOut)
                         {
                             descriptor.Attributes |= ParameterAttributes.Out;
                         }
@@ -154,14 +160,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 {
                     // Add ExecutionContext to provide access to InvocationId, etc.
                     descriptors.Add(new ParameterDescriptor(ScriptConstants.SystemExecutionContextParameterName, typeof(ExecutionContext)));
-                }
-
-                // If we have an HTTP trigger binding but no parameter binds to the raw HttpRequestMessage,
-                // add it as a system parameter so it is accessible later in the pipeline.
-                if (string.Compare(triggerMetadata.Type, "httptrigger", StringComparison.OrdinalIgnoreCase) == 0 &&
-                    !descriptors.Any(p => p.Type == typeof(HttpRequestMessage)))
-                {
-                    descriptors.Add(new ParameterDescriptor(ScriptConstants.SystemTriggerParameterName, typeof(HttpRequestMessage)));
                 }
 
                 if (TryCreateReturnValueParameterDescriptor(functionTarget.ReturnType, bindings, out descriptor))
@@ -188,28 +186,23 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             // We were unable to compile the function to get its signature,
             // setup the descriptor with the default parameters
             methodAttributes.Clear();
-            return base.GetFunctionParameters(functionInvoker, functionMetadata, triggerMetadata, methodAttributes, inputBindings, outputBindings);
+            return await base.GetFunctionParametersAsync(functionInvoker, functionMetadata, triggerMetadata, methodAttributes, inputBindings, outputBindings);
         }
 
         internal static bool TryCreateReturnValueParameterDescriptor(Type functionReturnType, IEnumerable<FunctionBinding> bindings, out ParameterDescriptor descriptor)
         {
             descriptor = null;
-
-            var returnBinding = bindings.SingleOrDefault(p => p.Metadata.IsReturn);
-            if (returnBinding == null)
+            if (string.Equals(functionReturnType.FullName, "Microsoft.FSharp.Core.Unit", StringComparison.Ordinal) ||
+                _taskOfUnitType.Value.IsMatch(functionReturnType.FullName))
             {
                 return false;
             }
-            var resultBinding = returnBinding as IResultProcessingBinding;
-            if (resultBinding != null)
+            if (functionReturnType == typeof(void) || functionReturnType == typeof(Task))
             {
-                if (resultBinding.CanProcessResult(true))
-                {
-                    // The trigger binding (ie, httpTrigger) will handle the return.
-                    return false;
-                }
+                return false;
             }
 
+            // Task<T>
             if (typeof(Task).IsAssignableFrom(functionReturnType))
             {
                 if (!(functionReturnType.IsGenericType && functionReturnType.GetGenericTypeDefinition() == typeof(Task<>)))
@@ -223,12 +216,16 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             descriptor = new ParameterDescriptor(ScriptConstants.SystemReturnParameterName, byRefType);
             descriptor.Attributes |= ParameterAttributes.Out;
 
-            Collection<CustomAttributeBuilder> customAttributes = returnBinding.GetCustomAttributes(byRefType);
-            if (customAttributes != null)
+            var returnBinding = bindings.SingleOrDefault(p => p.Metadata.IsReturn);
+            if (returnBinding != null)
             {
-                foreach (var customAttribute in customAttributes)
+                Collection<CustomAttributeBuilder> customAttributes = returnBinding.GetCustomAttributes(byRefType);
+                if (customAttributes != null)
                 {
-                    descriptor.CustomAttributes.Add(customAttribute);
+                    foreach (var customAttribute in customAttributes)
+                    {
+                        descriptor.CustomAttributes.Add(customAttribute);
+                    }
                 }
             }
 

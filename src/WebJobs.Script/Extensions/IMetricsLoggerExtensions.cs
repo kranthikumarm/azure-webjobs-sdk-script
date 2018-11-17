@@ -8,28 +8,33 @@ namespace Microsoft.Azure.WebJobs.Script
 {
     public static class IMetricsLoggerExtensions
     {
-        public static IDisposable LatencyEvent(this IMetricsLogger metricsLogger, string eventName)
+        public static IDisposable LatencyEvent(this IMetricsLogger metricsLogger, string eventName, string functionName = null)
         {
-            return new DisposableEvent(eventName, metricsLogger);
+            return new DisposableEvent(eventName, functionName, metricsLogger);
         }
 
         private class DisposableEvent : IDisposable
         {
             private readonly object _metricEvent;
             private readonly IMetricsLogger _metricsLogger;
+            private bool _disposed;
 
-            public DisposableEvent(string eventName, IMetricsLogger metricsLogger)
+            public DisposableEvent(string eventName, string functionName, IMetricsLogger metricsLogger)
             {
-                _metricEvent = metricsLogger.BeginEvent(eventName);
+                _metricEvent = metricsLogger.BeginEvent(eventName, functionName);
                 _metricsLogger = metricsLogger;
             }
 
             public void Dispose()
             {
-                if (_metricsLogger != null && _metricEvent != null)
+                if (!_disposed)
                 {
-                    _metricsLogger.EndEvent(_metricEvent);
+                    if (_metricsLogger != null && _metricEvent != null)
+                    {
+                        _metricsLogger.EndEvent(_metricEvent);
+                    }
                 }
+                _disposed = true;
             }
         }
     }

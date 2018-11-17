@@ -1,8 +1,11 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Runtime.Loader;
+using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
 
 namespace Microsoft.Azure.WebJobs.Script.Description
@@ -13,24 +16,24 @@ namespace Microsoft.Azure.WebJobs.Script.Description
     /// </summary>
     public class ExtensionSharedAssemblyProvider : ISharedAssemblyProvider
     {
-        private readonly ICollection<ScriptBindingProvider> _bindingProviders;
+        private readonly ICollection<IScriptBindingProvider> _bindingProviders;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="ExtensionSharedAssemblyProvider"/> class.
         /// </summary>
         /// <param name="bindingProviders">The collection of <see cref="ScriptBindingProvider"/>s.</param>
-        public ExtensionSharedAssemblyProvider(ICollection<ScriptBindingProvider> bindingProviders)
+        public ExtensionSharedAssemblyProvider(ICollection<IScriptBindingProvider> bindingProviders)
         {
-            _bindingProviders = bindingProviders;
+            _bindingProviders = bindingProviders ?? throw new ArgumentNullException(nameof(bindingProviders));
         }
 
-        public bool TryResolveAssembly(string assemblyName, out Assembly assembly)
+        public bool TryResolveAssembly(string assemblyName, AssemblyLoadContext targetContext, out Assembly assembly)
         {
             assembly = null;
 
             foreach (var bindingProvider in _bindingProviders)
             {
-                if (bindingProvider.TryResolveAssembly(assemblyName, out assembly) ||
+                if (bindingProvider.TryResolveAssembly(assemblyName, targetContext, out assembly) ||
                     TryResolveExtensionAssembly(bindingProvider, assemblyName, out assembly))
                 {
                     break;
@@ -40,12 +43,12 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return assembly != null;
         }
 
-        private static bool TryResolveExtensionAssembly(ScriptBindingProvider bindingProvider, string assemblyName, out Assembly assembly)
+        private static bool TryResolveExtensionAssembly(IScriptBindingProvider bindingProvider, string assemblyName, out Assembly assembly)
         {
             assembly = null;
             Assembly providerAssembly = bindingProvider.GetType().Assembly;
 
-            if (string.Compare(assemblyName, providerAssembly.GetName().Name) == 0)
+            if (string.Compare(assemblyName, AssemblyNameCache.GetName(providerAssembly).Name) == 0)
             {
                 assembly = providerAssembly;
             }

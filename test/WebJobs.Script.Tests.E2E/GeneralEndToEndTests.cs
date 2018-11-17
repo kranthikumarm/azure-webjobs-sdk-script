@@ -10,12 +10,13 @@ using System.Text;
 using System.Threading.Tasks;
 using Microsoft.ApplicationInsights;
 using Microsoft.ApplicationInsights.DataContracts;
-using Microsoft.ServiceBus;
-using Microsoft.ServiceBus.Messaging;
+using Microsoft.Azure.ServiceBus.Management;
 using Newtonsoft.Json.Linq;
+using WebJobs.Script.Tests.EndToEnd.Shared;
 using Xunit;
 
-namespace WebJobs.Script.EndToEndTests
+
+namespace WebJobs.Script.Tests.EndToEnd
 {
     [Collection(Constants.FunctionAppCollectionName)]
     public class GeneralEndToEndTests
@@ -58,20 +59,6 @@ namespace WebJobs.Script.EndToEndTests
 
         [Fact]
         [TestTrace]
-        public async Task Version_MatchesExpectedVersion()
-        {
-            using (var client = CreateClient())
-            {
-                HttpResponseMessage response = await client.GetAsync($"/admin/host/status?code={_fixture.FunctionAppMasterKey}");
-
-                var status = await response.Content.ReadAsAsync<dynamic>();
-
-                _fixture.Assert.Equals(Settings.RuntimeVersion, status.version.ToString());
-            }
-        }
-
-        [Fact]
-        [TestTrace]
         public async Task AppSettingInformation_ReturnsAppSettingValue()
         {
             using (var client = CreateClient())
@@ -80,7 +67,7 @@ namespace WebJobs.Script.EndToEndTests
 
                 string response = await client.GetStringAsync($"api/appsettinginformation?code={_fixture.FunctionDefaultKey}");
 
-                _fixture.Assert.Equals("~1", response);
+                _fixture.Assert.Equals("~2", response);
             }
         }
 
@@ -112,49 +99,18 @@ namespace WebJobs.Script.EndToEndTests
             }
         }
 
-        [Fact]
-        [TestTrace]
-        public async Task Invocation_Logs_AreReturned()
-        {
-            using (var client = CreateClient())
-            {
-                client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("text/plain"));
-
-                string invocationId = await client.GetStringAsync($"api/GetInvocationId?code={_fixture.FunctionDefaultKey}");
-
-                string siteName = NormalizeFunctionName(Settings.SiteName);
-                JToken resultToken = null;
-                // We retry for a bit as data may take a while to become available
-                for (int i = 0; i < 20; i++)
-                {
-                    var invocationsRequest = new HttpRequestMessage(HttpMethod.Get, $"azurejobs/api/functions/definitions/{siteName}-GetInvocationId/invocations?limit=10");
-                    var response = await _fixture.KuduClient.SendAsync(invocationsRequest);
-
-                    var results = await response.Content.ReadAsAsync<JObject>();
-
-                    resultToken = results.SelectToken($"$..entries[?(@.id == '{invocationId}')]");
-
-                    if (resultToken != null)
-                    {
-                        break;
-                    }
-
-                    await Task.Delay(3000);
-                }
-
-                _fixture.Assert.True(resultToken != null);
-            }
-        }
-
-        [Fact]
+        [Fact(Skip = "Requires Extension installation")]
         [TestTrace]
         public async Task ServiceBus_Node_DoesNotExhaustConnections()
         {
             var connectionString = Environment.GetEnvironmentVariable("AzureWebJobsServiceBus");
-            NamespaceManager manager = NamespaceManager.CreateFromConnectionString(connectionString);
+            ManagementClient manager = new ManagementClient(connectionString);
 
             // Start with an empty queue
-            await manager.DeleteQueueAsync("node");
+            if (await manager.QueueExistsAsync("node"))
+            {
+                await manager.DeleteQueueAsync("node");
+            }
 
             // Pre-create the queue as we can end up with 409s if a bunch of requests
             // try to create the queue at once
@@ -199,8 +155,8 @@ namespace WebJobs.Script.EndToEndTests
                 }
             }
 
-            QueueDescription queueDescription = manager.GetQueue("node");
-            Assert.Equal(i * j, queueDescription.MessageCountDetails.ActiveMessageCount);
+            var queueInfo = await manager.GetQueueRuntimeInfoAsync("node");
+            Assert.Equal(i * j, queueInfo.MessageCount);
         }
 
         // Assumes we have a valid function name.

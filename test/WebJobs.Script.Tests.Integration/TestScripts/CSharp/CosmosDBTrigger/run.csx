@@ -1,4 +1,4 @@
-﻿#r "Microsoft.Azure.Documents.Client"
+﻿#r "Microsoft.Azure.DocumentDB.Core"
 
 using Microsoft.Azure.Documents;
 using System.Collections.Generic;

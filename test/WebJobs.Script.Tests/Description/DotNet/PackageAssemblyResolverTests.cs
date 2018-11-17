@@ -43,7 +43,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             if (Directory.Exists(_runPath))
             {
-                Directory.Delete(_runPath, true);
+                try
+                {
+                    Directory.Delete(_runPath, true);
+                }
+                catch
+                {
+                    // best effort cleanup
+                }
             }
 
             _settingsManager.SetSetting(EnvironmentSettingNames.AzureWebsiteHomePath, _oldHomeEnv);
@@ -58,7 +65,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             Assert.Equal("Test.Package", package.Name);
             Assert.Equal("1.0.0", package.Version);
-            Assert.Equal(1, package.Assemblies.Count);
+            Assert.Equal(1, package.CompileTimeAssemblies.Count);
             Assert.Equal(2, package.FrameworkAssemblies.Count);
         }
 
@@ -109,7 +116,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 Name = "TestFunction",
                 ScriptFile = _lockFilePath, /*We just need the path from this*/
-                ScriptType = ScriptType.CSharp
+                Language = DotNetScriptTypes.CSharp
             };
 
             string functionDirectory = Path.GetDirectoryName(functionMetadata.ScriptFile);

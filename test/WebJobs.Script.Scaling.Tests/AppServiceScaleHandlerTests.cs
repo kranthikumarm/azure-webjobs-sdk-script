@@ -13,7 +13,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
     [Collection("Azure Test Collection")]
     public class AppServiceScaleHandlerTests
     {
-        [Theory, MemberData("PingWorkerData")]
+        [Theory, MemberData(nameof(PingWorkerData))]
         public async Task PingWorkerTests(HttpStatusCode statusCode, string reasonPhrase, bool expected, HttpRequestException expectedException)
         {
             var activityId = Guid.NewGuid().ToString();
@@ -24,6 +24,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             AppServiceSettings.WorkerName = "127.0.0.1";
             AppServiceSettings.HomeStampName = "waws-prod-home-stamp";
             AppServiceSettings.CurrentStampName = "waws-prod-slave-stamp";
+            AppServiceSettings.RuntimeEncryptionKey = ScaleUtilsTests.GenerateEncryptionKey();
             try
             {
                 AppServiceScaleHandler.HttpMessageHandler = mockHttpMessageHandler;
@@ -73,7 +74,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             }
         }
 
-        [Theory, MemberData("AddWorkerData")]
+        [Theory, MemberData(nameof(AddWorkerData))]
         public async Task AddWorkerTests(HttpStatusCode statusCode, string reasonPhrase, string expected, HttpRequestException expectedException)
         {
             var activityId = Guid.NewGuid().ToString();
@@ -84,6 +85,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             AppServiceSettings.WorkerName = "127.0.0.1";
             AppServiceSettings.HomeStampName = "waws-prod-home-stamp";
             AppServiceSettings.CurrentStampName = "waws-prod-slave-stamp";
+            AppServiceSettings.RuntimeEncryptionKey = ScaleUtilsTests.GenerateEncryptionKey();
             try
             {
                 AppServiceScaleHandler.HttpMessageHandler = mockHttpMessageHandler;
@@ -134,7 +136,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             }
         }
 
-        [Theory, MemberData("RemoveWorkerData")]
+        [Theory, MemberData(nameof(RemoveWorkerData))]
         public async Task RemoveWorkerTests(HttpStatusCode statusCode, Exception expectedException)
         {
             var activityId = Guid.NewGuid().ToString();
@@ -145,6 +147,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             AppServiceSettings.WorkerName = "127.0.0.1";
             AppServiceSettings.HomeStampName = "waws-prod-home-stamp";
             AppServiceSettings.CurrentStampName = "waws-prod-slave-stamp";
+            AppServiceSettings.RuntimeEncryptionKey = ScaleUtilsTests.GenerateEncryptionKey();
             try
             {
                 AppServiceScaleHandler.HttpMessageHandler = mockHttpMessageHandler;
@@ -198,6 +201,7 @@ namespace Microsoft.Azure.WebJobs.Script.Scaling.Tests
             AppServiceSettings.WorkerName = null;
             AppServiceSettings.HomeStampName = null;
             AppServiceSettings.CurrentStampName = null;
+            AppServiceSettings.RuntimeEncryptionKey = null;
         }
     }
 }

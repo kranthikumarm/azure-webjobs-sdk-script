@@ -3,14 +3,6 @@
   "$schema": "http://json-schema.org/draft-04/schema#",
   "type": "object",
   "properties": {
-    "disabled": {
-      "type": "boolean",
-      "description": "If set to true, marks the function as disabled (it cannot be triggered)."
-    },
-    "excluded": {
-      "type": "boolean",
-      "description": "If set to true, the function will not be loaded, compiled, or triggered."
-    },
     "scriptFile": {
       "type": "string",
       "description": "Optional path to function script file."
@@ -18,6 +10,10 @@
     "entryPoint": {
       "type": "string",
       "description": "Optional named entry point."
+    },
+    "configurationSource": {
+      "enum": [ "attributes", "config" ],
+      "description": "For C# precompiled functions only. If set to 'attributes', use WebJobs attributes to specify bindings. Otherwise, use the 'bindings' property of this function.json."
     },
     "bindings": {
       "type": "array",
@@ -258,10 +254,6 @@
             "route": {
               "type": "string",
               "description": "The function HTTP route template."
-            },
-            "webHookType": {
-              "type": "string",
-              "description": "The type of WebHook handled by the trigger (if handling a pre-defined WebHook)."
             },
             "authLevel": {
               "type": "string",

@@ -2,10 +2,14 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Diagnostics;
 using System.IO;
+using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -43,13 +47,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public void ManualTest()
         {
-            JobHostConfiguration config = new JobHostConfiguration();
-            config.UseScriptExtensions();
-            TestTraceWriter traceWriter = new TestTraceWriter(TraceLevel.Verbose);
-            JObject hostMetadata = new JObject();
-            var provider = new GeneralScriptBindingProvider(config, hostMetadata, traceWriter);
-            var metadataProvider = new JobHost(config).CreateMetadataProvider();
-            provider.CompleteInitialization(metadataProvider);
+            var metadataProvider = TestHelpers.GetDefaultHost()
+                .Services.GetService<IJobHostMetadataProvider>();
+
+            var provider = new GeneralScriptBindingProvider(NullLogger<GeneralScriptBindingProvider>.Instance, metadataProvider);
 
             JObject bindingMetadata = new JObject
             {
@@ -67,6 +68,26 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             var attr = binding.GetAttributes()[0];
             Assert.IsType<ManualTriggerAttribute>(attr);
+        }
+
+        [Fact]
+        public void TryCreate_NoMatchingMetadata_DoesNotCreateBinding()
+        {
+            JObject bindingMetadata = new JObject
+            {
+                { "type", "unknown" },
+                { "name", "test" },
+                { "direction", "out" }
+            };
+            ScriptBindingContext context = new ScriptBindingContext(bindingMetadata);
+            ScriptBinding binding = null;
+
+            var mockMetadataProvider = new Mock<IJobHostMetadataProvider>();
+            var provider = new GeneralScriptBindingProvider(NullLogger<GeneralScriptBindingProvider>.Instance, mockMetadataProvider.Object);
+            bool created = provider.TryCreate(context, out binding);
+
+            Assert.False(created);
+            Assert.Null(binding);
         }
     }
 }

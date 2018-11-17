@@ -27,15 +27,15 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Models
         public string Version { get; set; }
 
         /// <summary>
+        /// Gets or sets the host version details. This provides the host informational version.
+        /// </summary>
+        [JsonProperty(PropertyName = "versionDetails", DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public string VersionDetails { get; set; }
+
+        /// <summary>
         /// Gets or sets the collection of errors for the host.
         /// </summary>
         [JsonProperty(PropertyName = "errors", DefaultValueHandling = DefaultValueHandling.Ignore)]
         public Collection<string> Errors { get; set; }
-
-        /// <summary>
-        /// Gets or sets a the <see cref="LoadStatus"/>.
-        /// </summary>
-        [JsonProperty(PropertyName = "load", DefaultValueHandling = DefaultValueHandling.Ignore)]
-        public LoadStatus Load { get; set; }
     }
 }

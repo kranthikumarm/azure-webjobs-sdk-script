@@ -12,7 +12,7 @@ public static void Run(ScenarioInput input, out string blob, TraceWriter trace, 
     {
         blob = input.Value;
     }
-    else if (input.Scenario == "fileLogging")
+    else if (input.Scenario == "logging")
     {
         // we'll get two guids as the payload; split them
         var guids = input.Value.Split(';');
@@ -23,8 +23,8 @@ public static void Run(ScenarioInput input, out string blob, TraceWriter trace, 
     {
         var logPayload = new
         {
-            InvocationId = context.InvocationId,
-            Trace = input.Value
+            invocationId = context.InvocationId,
+            trace = input.Value
         };
 
         logger.LogInformation(JObject.FromObject(logPayload).ToString(Formatting.None));

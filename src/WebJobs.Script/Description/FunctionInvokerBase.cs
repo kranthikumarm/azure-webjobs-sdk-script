@@ -10,7 +10,7 @@ using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.CodeAnalysis;
@@ -23,38 +23,27 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         private bool _disposed = false;
         private IDisposable _fileChangeSubscription;
 
-        internal FunctionInvokerBase(ScriptHost host, FunctionMetadata functionMetadata)
-            : this(host, functionMetadata, new FunctionLogger(host, functionMetadata.Name))
-        {
-        }
-
-        internal FunctionInvokerBase(ScriptHost host, FunctionMetadata functionMetadata, FunctionLogger logInfo)
+        internal FunctionInvokerBase(ScriptHost host, FunctionMetadata functionMetadata, ILoggerFactory loggerFactory, string logDirName = null)
         {
             Host = host;
             Metadata = functionMetadata;
-            LogInfo = logInfo;
+            FunctionLogger = loggerFactory.CreateLogger(LogCategories.CreateFunctionCategory(functionMetadata.Name));
         }
 
-        protected static IDictionary<string, object> PrimaryHostTraceProperties { get; }
-            = new ReadOnlyDictionary<string, object>(new Dictionary<string, object> { { ScriptConstants.TracePropertyPrimaryHostKey, true } });
+        protected static IDictionary<string, object> PrimaryHostLogProperties { get; }
+            = new ReadOnlyDictionary<string, object>(new Dictionary<string, object> { { ScriptConstants.LogPropertyPrimaryHostKey, true } });
 
-        protected static IDictionary<string, object> PrimaryHostUserTraceProperties { get; }
-            = new ReadOnlyDictionary<string, object>(new Dictionary<string, object>(PrimaryHostTraceProperties) { { ScriptConstants.TracePropertyIsUserTraceKey, true } });
+        protected static IDictionary<string, object> PrimaryHostUserLogProperties { get; }
+            = new ReadOnlyDictionary<string, object>(new Dictionary<string, object>(PrimaryHostLogProperties) { { ScriptConstants.LogPropertyIsUserLogKey, true } });
 
-        protected static IDictionary<string, object> PrimaryHostSystemTraceProperties { get; }
-            = new ReadOnlyDictionary<string, object>(new Dictionary<string, object>(PrimaryHostTraceProperties) { { ScriptConstants.TracePropertyIsSystemTraceKey, true } });
+        protected static IDictionary<string, object> PrimaryHostSystemLogProperties { get; }
+            = new ReadOnlyDictionary<string, object>(new Dictionary<string, object>(PrimaryHostLogProperties) { { ScriptConstants.LogPropertyIsSystemLogKey, true } });
 
         public ScriptHost Host { get; }
 
-        public FunctionLogger LogInfo { get; }
+        public ILogger FunctionLogger { get; }
 
         public FunctionMetadata Metadata { get; }
-
-        protected TraceWriter TraceWriter => LogInfo.TraceWriter;
-
-        protected ILogger Logger => LogInfo.Logger;
-
-        public TraceWriter FileTraceWriter => LogInfo.FileTraceWriter;
 
         /// <summary>
         /// All unhandled invocation exceptions will flow through this method.
@@ -70,12 +59,12 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
         protected virtual void TraceError(string errorMessage)
         {
-            LogInfo.TraceError(errorMessage);
+            FunctionLogger.LogError(errorMessage);
         }
 
         protected bool InitializeFileWatcherIfEnabled()
         {
-            if (Host.ScriptConfig.FileWatchingEnabled)
+            if (Host.ScriptOptions.FileWatchingEnabled)
             {
                 string functionBasePath = Path.GetDirectoryName(Metadata.ScriptFile) + Path.DirectorySeparatorChar;
                 _fileChangeSubscription = Host.EventManager.OfType<FileEvent>()
@@ -89,10 +78,10 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             return false;
         }
 
-        public async Task Invoke(object[] parameters)
+        public async Task<object> Invoke(object[] parameters)
         {
             FunctionInvocationContext context = GetContextFromParameters(parameters, Metadata);
-            await InvokeCore(parameters, context);
+            return await InvokeCore(parameters, context);
         }
 
         private static FunctionInvocationContext GetContextFromParameters(object[] parameters, FunctionMetadata metadata)
@@ -103,7 +92,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             functionExecutionContext.FunctionName = metadata.Name;
 
             // These may not be present, so null is okay.
-            TraceWriter functionTraceWriter = parameters.OfType<TraceWriter>().FirstOrDefault();
             Binder binder = parameters.OfType<Binder>().FirstOrDefault();
             ILogger logger = parameters.OfType<ILogger>().FirstOrDefault();
 
@@ -111,7 +99,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             {
                 ExecutionContext = functionExecutionContext,
                 Binder = binder,
-                TraceWriter = functionTraceWriter,
                 Logger = logger
             };
 
@@ -126,55 +113,59 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 string eventName = binding.IsTrigger ?
                     string.Format(MetricEventNames.FunctionBindingTypeFormat, binding.Type) :
                     string.Format(MetricEventNames.FunctionBindingTypeDirectionFormat, binding.Type, binding.Direction);
-                metrics.LogEvent(eventName);
+                metrics.LogEvent(eventName, metadata.Name);
             }
 
             return metrics.BeginEvent(MetricEventNames.FunctionInvokeLatency, metadata.Name);
         }
 
-        protected abstract Task InvokeCore(object[] parameters, FunctionInvocationContext context);
+        protected abstract Task<object> InvokeCore(object[] parameters, FunctionInvocationContext context);
 
         protected virtual void OnScriptFileChanged(FileSystemEventArgs e)
         {
         }
 
-        protected void TraceOnPrimaryHost(string message, TraceLevel level, string source = null,  Exception exception = null)
+        protected internal void LogOnPrimaryHost(string message, LogLevel level, Exception exception = null)
         {
-            TraceWriter.Trace(message, level, PrimaryHostTraceProperties);
-            var traceEvent = new TraceEvent(level, message, source, exception);
-            foreach (var item in PrimaryHostTraceProperties)
-            {
-                traceEvent.Properties.Add(item);
-            }
-            TraceWriter.Trace(traceEvent);
+            IDictionary<string, object> properties = new Dictionary<string, object>(PrimaryHostLogProperties);
+
+            FunctionLogger.Log(level, 0, properties, exception, (state, ex) => message);
         }
 
-        internal void TraceCompilationDiagnostics(ImmutableArray<Diagnostic> diagnostics, LogTargets logTarget = LogTargets.All)
+        internal void TraceCompilationDiagnostics(ImmutableArray<Diagnostic> diagnostics, LogTargets logTarget = LogTargets.All, bool isInvocation = false)
         {
             if (logTarget == LogTargets.None)
             {
                 return;
             }
 
-            TraceWriter traceWriter = LogInfo.TraceWriter;
-            IDictionary<string, object> properties = PrimaryHostTraceProperties;
-
+            // build the log state based on inputs
+            Dictionary<string, object> logState = new Dictionary<string, object>();
+            if (!isInvocation)
+            {
+                // generally we only want to trace compilation diagnostics on the single primary
+                // host, to avoid duplicate log statements in the case of file save operations.
+                // however if the function is being invoked, we always want to output detailed
+                // information.
+                logState.Add(ScriptConstants.LogPropertyPrimaryHostKey, true);
+            }
             if (!logTarget.HasFlag(LogTargets.User))
             {
-                traceWriter = Host.TraceWriter;
-                properties = PrimaryHostSystemTraceProperties;
+                logState.Add(ScriptConstants.LogPropertyIsSystemLogKey, true);
             }
             else if (!logTarget.HasFlag(LogTargets.System))
             {
-                properties = PrimaryHostUserTraceProperties;
+                logState.Add(ScriptConstants.LogPropertyIsUserLogKey, true);
             }
 
+            // log the diagnostics
             foreach (var diagnostic in diagnostics.Where(d => !d.IsSuppressed))
             {
-                traceWriter.Trace(diagnostic.ToString(), diagnostic.Severity.ToTraceLevel(), properties);
+                FunctionLogger.Log(diagnostic.Severity.ToLogLevel(), 0, logState, null, (s, e) => diagnostic.ToString());
             }
 
-            if (Host.InDebugMode && Host.IsPrimary)
+            // log structured logs
+            if (Host.InDebugMode && (Host.IsPrimary || isInvocation))
             {
                 Host.EventManager.Publish(new StructuredLogEntryEvent(() =>
                 {
@@ -208,8 +199,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 if (disposing)
                 {
                     _fileChangeSubscription?.Dispose();
-
-                    (LogInfo.TraceWriter as IDisposable)?.Dispose();
                 }
 
                 _disposed = true;
@@ -230,7 +219,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         private readonly FunctionMetadata _metadata;
         private readonly IMetricsLogger _metrics;
         private readonly Guid _invocationId;
-        private readonly FunctionLogger _logInfo;
 
         private readonly Stopwatch _invocationStopWatch = new Stopwatch();
 
@@ -240,19 +228,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         public FunctionInstanceMonitor(
             FunctionMetadata metadata,
             IMetricsLogger metrics,
-            Guid invocationId,
-            FunctionLogger logInfo)
+            Guid invocationId)
         {
             _metadata = metadata;
             _metrics = metrics;
             _invocationId = invocationId;
-            _logInfo = logInfo;
         }
 
         public void Start()
         {
-            _logInfo.LogFunctionStart(_invocationId.ToString());
-
             startedEvent = new FunctionStartedEvent(_invocationId, _metadata);
             _metrics.BeginEvent(startedEvent);
             invokeLatencyEvent = FunctionInvokerBase.LogInvocationMetrics(_metrics, _metadata);
@@ -262,8 +246,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
         // Called on success and failure
         public void End(bool success)
         {
-            _logInfo.LogFunctionResult(success, _invocationId.ToString(), _invocationStopWatch.ElapsedMilliseconds);
-
             startedEvent.Success = success;
             _metrics.EndEvent(startedEvent);
 

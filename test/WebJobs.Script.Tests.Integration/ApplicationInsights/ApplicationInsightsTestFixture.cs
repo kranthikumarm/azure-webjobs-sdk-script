@@ -1,40 +1,88 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using Microsoft.Azure.WebJobs.Script.Config;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Net.Http;
+using Microsoft.ApplicationInsights.Channel;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.WebJobs.Script.Tests;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.ApplicationInsights
 {
-    public abstract class ApplicationInsightsTestFixture : EndToEndTestFixture
+    public abstract class ApplicationInsightsTestFixture : IDisposable
     {
-        static ApplicationInsightsTestFixture()
-        {
-            // We need to set this to something in order to trigger App Insights integration. But since
-            // we're hitting a local HttpListener, it can be anything.
-            ScriptSettingsManager.Instance.ApplicationInsightsInstrumentationKey = TestChannelLoggerFactoryBuilder.ApplicationInsightsKey;
-        }
+        public const string ApplicationInsightsKey = "some_key";
 
         public ApplicationInsightsTestFixture(string scriptRoot, string testId)
-            : base(scriptRoot, testId)
         {
+            string scriptPath = Path.Combine(Environment.CurrentDirectory, scriptRoot);
+            string logPath = Path.Combine(Path.GetTempPath(), @"Functions");
+
+            WebHostOptions = new ScriptApplicationHostOptions
+            {
+                IsSelfHost = true,
+                ScriptPath = scriptPath,
+                LogPath = logPath,
+                SecretsPath = Environment.CurrentDirectory // not used
+            };
+
+            TestHost = new TestFunctionHost(scriptPath, logPath,
+                jobHostBuilder =>
+                {
+                    jobHostBuilder.Services.AddSingleton<ITelemetryChannel>(_ => Channel);
+                    jobHostBuilder.Services.AddSingleton<IMetricsLogger>(_ => MetricsLogger);
+
+                    jobHostBuilder.Services.Configure<ScriptJobHostOptions>(o =>
+                    {
+                        o.Functions = new[]
+                        {
+                            "Scenarios",
+                            "HttpTrigger-Scenarios"
+                        };
+                    });
+                },
+                configurationBuilder =>
+                {
+                    configurationBuilder.AddInMemoryCollection(new Dictionary<string, string>
+                    {
+                        [EnvironmentSettingNames.AppInsightsInstrumentationKey] = ApplicationInsightsKey
+                    });
+                });
+
+            HttpClient = TestHost.HttpClient;
+
+            TestHelpers.WaitForWebHost(HttpClient);
         }
 
         public TestTelemetryChannel Channel { get; private set; } = new TestTelemetryChannel();
 
-        protected override void InitializeConfig(ScriptHostConfiguration config)
+        public TestMetricsLogger MetricsLogger { get; private set; } = new TestMetricsLogger();
+
+        public TestFunctionHost TestHost { get; }
+
+        public ScriptApplicationHostOptions WebHostOptions { get; private set; }
+
+        public HttpClient HttpClient { get; private set; }
+
+        public void Dispose()
         {
-            var builder = new TestChannelLoggerFactoryBuilder(Channel);
-            config.HostConfig.AddService<ILoggerFactoryBuilder>(builder);
+            TestHost?.Dispose();
+            HttpClient?.Dispose();
+        }
 
-            // turn this off as it makes validation tough
-            config.HostConfig.Aggregator.IsEnabled = false;
-
-            config.OnConfigurationApplied = c =>
+        private class ScriptHostBuilder : IConfigureBuilder<IWebJobsBuilder>
+        {
+            public void Configure(IWebJobsBuilder builder)
             {
-                // Overwrite the generated function whitelist to only include one function.
-                c.Functions = new[] { "Scenarios" };
-            };
+                builder.Services.Configure<ScriptJobHostOptions>(o =>
+                {
+                    o.Functions = new[] { "Scenarios", "HttpTrigger-Scenarios" };
+                });
+            }
         }
     }
 }

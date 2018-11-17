@@ -3,119 +3,129 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
-using System.Linq;
+using System.Globalization;
+using System.Text;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Extensions.Logging;
 
 namespace Microsoft.Azure.WebJobs.Script.Diagnostics
 {
-    /// <summary>
-    /// A wrapper class to allow ILoggers from functions to write to the existing FileTraceWriter. This allows
-    /// logs to show up in the log files and stream in the portal.
-    /// </summary>
     internal class FileLogger : ILogger
     {
-        private readonly Func<string, LogLevel, bool> _filter;
+        private readonly FileWriter _fileWriter;
+        private readonly Func<bool> _isFileLoggingEnabled;
+        private readonly Func<bool> _isPrimary;
         private readonly string _categoryName;
-        private readonly IFunctionTraceWriterFactory _traceWriterFactory;
+        private readonly LogType _logType;
 
-        public FileLogger(string categoryName, IFunctionTraceWriterFactory traceWriterFactory, Func<string, LogLevel, bool> filter)
+        public FileLogger(string categoryName, FileWriter fileWriter, Func<bool> isFileLoggingEnabled, Func<bool> isPrimary, LogType logType)
         {
+            _fileWriter = fileWriter;
+            _isFileLoggingEnabled = isFileLoggingEnabled;
+            _isPrimary = isPrimary;
             _categoryName = categoryName;
-            _filter = filter;
-            _traceWriterFactory = traceWriterFactory;
+            _logType = logType;
         }
 
         public IDisposable BeginScope<TState>(TState state) => DictionaryLoggerScope.Push(state);
 
         public bool IsEnabled(LogLevel logLevel)
         {
-            if (_filter == null)
-            {
-                // if there is no filter, assume it is always enabled
-                return true;
-            }
-
-            return _filter(_categoryName, logLevel);
+            return _isFileLoggingEnabled();
         }
 
         public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
         {
-            IEnumerable<KeyValuePair<string, object>> properties = state as IEnumerable<KeyValuePair<string, object>>;
+            if (!IsEnabled(logLevel))
+            {
+                return;
+            }
+
+            var stateValues = state as IEnumerable<KeyValuePair<string, object>>;
             string formattedMessage = formatter?.Invoke(state, exception);
 
-            // If we have no structured data and no message, there's nothing to log
-            if ((string.IsNullOrEmpty(formattedMessage) && properties == null) ||
-                !IsEnabled(logLevel) || IsFromTraceWriter(properties))
+            // If we don't have a message, there's nothing to log.
+            if (string.IsNullOrEmpty(formattedMessage))
             {
                 return;
             }
 
-            TraceLevel traceLevel = GetTraceLevel(logLevel);
-            TraceEvent traceEvent = new TraceEvent(traceLevel, formattedMessage, _categoryName, exception);
-            string functionName = GetFunctionName();
+            bool isSystemTrace = Utility.GetStateBoolValue(stateValues, ScriptConstants.LogPropertyIsSystemLogKey);
+            if (isSystemTrace)
+            {
+                // System traces are not logged to files.
+                return;
+            }
 
-            // If we don't have a function name, we have no way to create a TraceWriter
-            if (functionName == null)
+            bool isPrimaryHostTrace = Utility.GetStateBoolValue(stateValues, ScriptConstants.LogPropertyPrimaryHostKey);
+            if (isPrimaryHostTrace && !_isPrimary())
             {
                 return;
             }
 
-            TraceWriter traceWriter = _traceWriterFactory.Create(functionName);
-            traceWriter.Trace(traceEvent);
-        }
-
-        private static string GetFunctionName()
-        {
-            IDictionary<string, object> scopeProperties = DictionaryLoggerScope.GetMergedStateDictionary();
-
-            if (!scopeProperties.TryGetValue(ScriptConstants.LoggerFunctionNameKey, out string functionName))
+            if (exception != null)
             {
-                return null;
+                if (exception is FunctionInvocationException ||
+                    exception is AggregateException)
+                {
+                    // we want to minimize the stack traces for function invocation
+                    // failures, so we drill into the very inner exception, which will
+                    // be the script error
+                    Exception actualException = exception;
+                    while (actualException.InnerException != null)
+                    {
+                        actualException = actualException.InnerException;
+                    }
+
+                    formattedMessage += $"{Environment.NewLine}{actualException.Message}";
+                }
+                else
+                {
+                    formattedMessage += $"{Environment.NewLine}{exception.ToFormattedString()}";
+                }
             }
 
-            // this function name starts with "Functions.", but file paths do not include this
-            string functionsPrefix = "Functions.";
-            if (functionName.StartsWith(functionsPrefix))
-            {
-                functionName = functionName.Substring(functionsPrefix.Length);
-            }
+            formattedMessage = FormatLine(stateValues, logLevel, formattedMessage);
+            _fileWriter.AppendLine(formattedMessage);
 
-            return functionName;
-        }
-
-        private static TraceLevel GetTraceLevel(LogLevel logLevel)
-        {
-            switch (logLevel)
+            // flush errors immediately
+            if (logLevel == LogLevel.Error || exception != null)
             {
-                case LogLevel.Trace:
-                case LogLevel.Debug:
-                    return TraceLevel.Verbose;
-                case LogLevel.Information:
-                    return TraceLevel.Info;
-                case LogLevel.Warning:
-                    return TraceLevel.Warning;
-                case LogLevel.Error:
-                case LogLevel.Critical:
-                    return TraceLevel.Error;
-                case LogLevel.None:
-                    return TraceLevel.Off;
-                default:
-                    throw new InvalidOperationException();
+                _fileWriter.Flush();
             }
         }
 
-        private static bool IsFromTraceWriter(IEnumerable<KeyValuePair<string, object>> properties)
+        /// <summary>
+        /// Format the log line for the current event being traced.
+        /// </summary>
+        /// <param name="stateValues">The event state.</param>
+        /// <param name="level">The event level.</param>
+        /// <param name="line">The log line to format.</param>
+        /// <returns>The formatted log message.</returns>
+        protected virtual string FormatLine(IEnumerable<KeyValuePair<string, object>> stateValues, LogLevel level, string line)
         {
-            if (properties == null)
+            string tracePrefix = GetLogPrefix(stateValues, level, _logType);
+            string timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+            string formattedLine = $"{timestamp} [{tracePrefix}] {line.Trim()}";
+
+            return formattedLine;
+        }
+
+        internal static string GetLogPrefix(IEnumerable<KeyValuePair<string, object>> stateValues, LogLevel level, LogType logType)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append(level.ToString());
+
+            if (logType == LogType.Host)
             {
-                return false;
+                var functionName = Utility.GetStateValueOrDefault<string>(stateValues, ScriptConstants.LogPropertyFunctionNameKey);
+                if (!string.IsNullOrEmpty(functionName))
+                {
+                    sb.AppendFormat(",{0}", functionName);
+                }
             }
-            else
-            {
-                return properties.Any(kvp => string.Equals(kvp.Key, ScriptConstants.TracePropertyIsUserTraceKey, StringComparison.OrdinalIgnoreCase));
-            }
+
+            return sb.ToString();
         }
     }
 }

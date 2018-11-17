@@ -12,7 +12,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 {
     public class TestSecretManager : ISecretManager
     {
-        public virtual Task PurgeOldSecretsAsync(string rootScriptPath, TraceWriter traceWriter, ILogger logger)
+        public virtual Task PurgeOldSecretsAsync(string rootScriptPath, ILogger logger)
         {
             throw new NotImplementedException();
         }
@@ -26,8 +26,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             return Task.FromResult<IDictionary<string, string>>(new Dictionary<string, string>
             {
-                { "Key1", "Value1" },
-                { "Key2", "Value2" },
+                { "Key1", $"{functionName}1".ToLowerInvariant() },
+                { "Key2", $"{functionName}2".ToLowerInvariant() },
             });
         }
 

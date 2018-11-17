@@ -2,6 +2,8 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
 using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 using Moq;
 using Xunit;
@@ -27,7 +29,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
         [Fact(DisplayName = "Response body is empty.")]
         public void ResponseBodyIsEmpty()
         {
-            Assert.Null(_fixture.HttpResponse.Content);
+            Assert.Equal(_fixture.HttpResponse.Content.Headers.ContentLength, 0);
         }
 
         [Fact(DisplayName = "The secret manager key delete is invoked.")]
@@ -40,17 +42,18 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Controllers
         {
             private readonly string _requestUri = "http://localhost/admin/functions/{0}/keys/TestKey";
 
-            public Fixture()
-            {
-                HttpClient.DefaultRequestHeaders.Add(AuthorizationLevelAttribute.FunctionsKeyHeaderName, "1234");
-                HttpResponse = HttpClient.DeleteAsync(FormattedRequestUri).Result;
-            }
-
-            public HttpResponseMessage HttpResponse { get; }
+            public HttpResponseMessage HttpResponse { get; private set; }
 
             public string FormattedRequestUri => string.Format(RequestUriFormat, TestKeyScope);
 
             protected virtual string RequestUriFormat => _requestUri;
+
+            public override async Task InitializeAsync()
+            {
+                await base.InitializeAsync();
+                HttpClient.DefaultRequestHeaders.Add(AuthenticationLevelHandler.FunctionsKeyHeaderName, "1234");
+                HttpResponse = HttpClient.DeleteAsync(FormattedRequestUri).Result;
+            }
 
             protected override Mock<TestSecretManager> BuildSecretManager()
             {

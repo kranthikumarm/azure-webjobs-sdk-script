@@ -9,7 +9,7 @@ using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Text.RegularExpressions;
-using Microsoft.Azure.WebJobs.Host;
+using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Binding;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Microsoft.Extensions.Logging;
@@ -21,17 +21,20 @@ namespace Microsoft.Azure.WebJobs.Script.Description
     {
         private static readonly Regex BindingNameValidationRegex = new Regex(string.Format("^([a-zA-Z][a-zA-Z0-9]{{0,127}}|{0})$", Regex.Escape(ScriptConstants.SystemReturnParameterBindingName)), RegexOptions.Compiled);
 
-        protected FunctionDescriptorProvider(ScriptHost host, ScriptHostConfiguration config)
+        protected FunctionDescriptorProvider(ScriptHost host, ScriptJobHostOptions config, ICollection<IScriptBindingProvider> bindingProviders)
         {
             Host = host;
             Config = config;
+            BindingProviders = bindingProviders;
         }
 
         protected ScriptHost Host { get; private set; }
 
-        protected ScriptHostConfiguration Config { get; private set; }
+        protected ScriptJobHostOptions Config { get; private set; }
 
-        public virtual bool TryCreate(FunctionMetadata functionMetadata, out FunctionDescriptor functionDescriptor)
+        protected ICollection<IScriptBindingProvider> BindingProviders { get; private set; }
+
+        public virtual async Task<(bool, FunctionDescriptor)> TryCreate(FunctionMetadata functionMetadata)
         {
             if (functionMetadata == null)
             {
@@ -41,12 +44,12 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             ValidateFunction(functionMetadata);
 
             // parse the bindings
-            Collection<FunctionBinding> inputBindings = FunctionBinding.GetBindings(Config, functionMetadata.InputBindings, FileAccess.Read);
-            Collection<FunctionBinding> outputBindings = FunctionBinding.GetBindings(Config, functionMetadata.OutputBindings, FileAccess.Write);
+            Collection<FunctionBinding> inputBindings = FunctionBinding.GetBindings(Config, BindingProviders, functionMetadata.InputBindings, FileAccess.Read);
+            Collection<FunctionBinding> outputBindings = FunctionBinding.GetBindings(Config, BindingProviders, functionMetadata.OutputBindings, FileAccess.Write);
+            VerifyResolvedBindings(functionMetadata, inputBindings, outputBindings);
 
             BindingMetadata triggerMetadata = functionMetadata.InputBindings.FirstOrDefault(p => p.IsTrigger);
             string scriptFilePath = Path.Combine(Config.RootScriptPath, functionMetadata.ScriptFile ?? string.Empty);
-            functionDescriptor = null;
             IFunctionInvoker invoker = null;
 
             try
@@ -54,14 +57,15 @@ namespace Microsoft.Azure.WebJobs.Script.Description
                 invoker = CreateFunctionInvoker(scriptFilePath, triggerMetadata, functionMetadata, inputBindings, outputBindings);
 
                 Collection<CustomAttributeBuilder> methodAttributes = new Collection<CustomAttributeBuilder>();
-                Collection<ParameterDescriptor> parameters = GetFunctionParameters(invoker, functionMetadata, triggerMetadata, methodAttributes, inputBindings, outputBindings);
+                Collection<ParameterDescriptor> parameters = await GetFunctionParametersAsync(invoker, functionMetadata, triggerMetadata, methodAttributes, inputBindings, outputBindings);
 
-                functionDescriptor = new FunctionDescriptor(functionMetadata.Name, invoker, functionMetadata, parameters, methodAttributes, inputBindings, outputBindings);
+                var functionDescriptor = new FunctionDescriptor(functionMetadata.Name, invoker, functionMetadata, parameters, methodAttributes, inputBindings, outputBindings);
 
-                return true;
+                return (true, functionDescriptor);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                Host.Logger.LogDebug(ex, $"Creating function descriptor for function {functionMetadata.Name} failed");
                 IDisposable disposableInvoker = invoker as IDisposable;
                 if (disposableInvoker != null)
                 {
@@ -72,7 +76,21 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             }
         }
 
-        protected virtual Collection<ParameterDescriptor> GetFunctionParameters(IFunctionInvoker functionInvoker, FunctionMetadata functionMetadata,
+        public void VerifyResolvedBindings(FunctionMetadata functionMetadata, IEnumerable<FunctionBinding> inputBindings, IEnumerable<FunctionBinding> outputBindings)
+        {
+            IEnumerable<string> bindingsFromMetadata = functionMetadata.InputBindings.Union(functionMetadata.OutputBindings).Select(f => f.Type);
+            IEnumerable<string> resolvedBindings = inputBindings.Union(outputBindings).Select(b => b.Metadata.Type);
+            IEnumerable<string> unresolvedBindings = bindingsFromMetadata.Except(resolvedBindings);
+
+            if (unresolvedBindings.Any())
+            {
+                string allUnresolvedBindings = string.Join(", ", unresolvedBindings);
+                throw new FunctionConfigurationException($"The binding type(s) '{allUnresolvedBindings}' are not registered. " +
+                        $"Please ensure the type is correct and the binding extension is installed.");
+            }
+        }
+
+        protected virtual Task<Collection<ParameterDescriptor>> GetFunctionParametersAsync(IFunctionInvoker functionInvoker, FunctionMetadata functionMetadata,
             BindingMetadata triggerMetadata, Collection<CustomAttributeBuilder> methodAttributes, Collection<FunctionBinding> inputBindings, Collection<FunctionBinding> outputBindings)
         {
             if (functionInvoker == null)
@@ -98,9 +116,6 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             ParameterDescriptor triggerParameter = CreateTriggerParameter(triggerMetadata);
             parameters.Add(triggerParameter);
 
-            // Add a TraceWriter for logging
-            parameters.Add(new ParameterDescriptor(ScriptConstants.SystemLogParameterName, typeof(TraceWriter)));
-
             // Add an IBinder to support the binding programming model
             parameters.Add(new ParameterDescriptor(ScriptConstants.SystemBinderParameterName, typeof(IBinder)));
 
@@ -109,14 +124,20 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             parameters.Add(new ParameterDescriptor(ScriptConstants.SystemLoggerParameterName, typeof(ILogger)));
 
-            return parameters;
+            return Task.FromResult(parameters);
         }
 
         protected virtual ParameterDescriptor CreateTriggerParameter(BindingMetadata triggerMetadata, Type parameterType = null)
         {
-            ParameterDescriptor triggerParameter = null;
-            TryParseTriggerParameter(triggerMetadata.Raw, out triggerParameter, parameterType);
-            triggerParameter.IsTrigger = true;
+            if (TryParseTriggerParameter(triggerMetadata.Raw, out ParameterDescriptor triggerParameter, parameterType))
+            {
+                triggerParameter.IsTrigger = true;
+            }
+            else
+            {
+                throw new FunctionConfigurationException($"The binding type '{triggerMetadata.Type}' is not registered. " +
+                    $"Please ensure the type is correct and the binding extension is installed.");
+            }
 
             return triggerParameter;
         }
@@ -127,7 +148,7 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
             ScriptBindingContext bindingContext = new ScriptBindingContext(metadata);
             ScriptBinding binding = null;
-            foreach (var provider in this.Config.BindingProviders)
+            foreach (var provider in BindingProviders)
             {
                 if (provider.TryCreate(bindingContext, out binding))
                 {
@@ -196,9 +217,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
         protected static void ApplyMethodLevelAttributes(FunctionMetadata functionMetadata, BindingMetadata triggerMetadata, Collection<CustomAttributeBuilder> methodAttributes)
         {
-            if (functionMetadata.IsDisabled ||
-                (string.Compare("httptrigger", triggerMetadata.Type, StringComparison.OrdinalIgnoreCase) == 0 ||
-                string.Compare("manualtrigger", triggerMetadata.Type, StringComparison.OrdinalIgnoreCase) == 0))
+            if (string.Compare("httptrigger", triggerMetadata.Type, StringComparison.OrdinalIgnoreCase) == 0 ||
+                string.Compare("manualtrigger", triggerMetadata.Type, StringComparison.OrdinalIgnoreCase) == 0)
             {
                 // the function can be run manually, but there will be no automatic
                 // triggering

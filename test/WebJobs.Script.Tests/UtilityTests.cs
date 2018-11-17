@@ -5,13 +5,10 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Dynamic;
-using System.Linq;
-using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Script.Config;
-using Moq;
+using Microsoft.WebJobs.Script.Tests;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -49,20 +46,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
     public class UtilityTests
     {
         [Fact]
-        public void TryMatchAssembly_ReturnsExpectedResult()
+        public async Task InvokeWithRetriesAsync_Throws_WhenRetryCountExceeded()
         {
-            Assembly assembly = null;
-            bool result = Utility.TryMatchAssembly("Microsoft.Azure.WebJobs.Extensions.SendGrid", typeof(SendGridAttribute), out assembly);
-            Assert.True(result);
-            Assert.Same(typeof(SendGridAttribute).Assembly, assembly);
+            var ex = new Exception("Kaboom!");
+            var result = await Assert.ThrowsAsync<Exception>(async () =>
+            {
+                await Utility.InvokeWithRetriesAsync(() => throw ex, maxRetries: 4, retryInterval: TimeSpan.FromMilliseconds(25));
+            });
+            Assert.Same(ex, result);
+        }
 
-            result = Utility.TryMatchAssembly("MICROSOFT.AZURE.WEBJOBS.EXTENSIONS.SENDGRID", typeof(SendGridAttribute), out assembly);
-            Assert.True(result);
-            Assert.Same(typeof(SendGridAttribute).Assembly, assembly);
-
-            result = Utility.TryMatchAssembly("Microsoft.Azure.WebJobs.FooBar", typeof(SendGridAttribute), out assembly);
-            Assert.False(result);
-            Assert.Null(assembly);
+        [Fact]
+        public async Task InvokeWithRetriesAsync_Succeeds_AfterSeveralRetries()
+        {
+            int count = 0;
+            await Utility.InvokeWithRetriesAsync(() =>
+            {
+                if (count++ < 3)
+                {
+                    throw new Exception("Kaboom!");
+                }
+            }, maxRetries: 4, retryInterval: TimeSpan.FromMilliseconds(25));
         }
 
         [Fact]
@@ -76,7 +80,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             sw.Start();
             await Utility.DelayWithBackoffAsync(20, tokenSource.Token);
             sw.Stop();
-            Assert.True(sw.ElapsedMilliseconds < 1000, $"Expected sw.ElapsedMilliseconds < 1000; Actual: {sw.ElapsedMilliseconds}");
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(2), $"Expected sw.Elapsed < TimeSpan.FromSeconds(2); Actual: {sw.Elapsed.TotalMilliseconds}");
         }
 
         [Fact]
@@ -86,7 +90,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             sw.Start();
             await Utility.DelayWithBackoffAsync(2, CancellationToken.None);
             sw.Stop();
-            Assert.True(sw.ElapsedMilliseconds >= 2000, $"Expected sw.ElapsedMilliseconds >= 2000; Actual: {sw.ElapsedMilliseconds}");
+
+            // Workaround annoying test failures such as "Expected sw.Elapsed >= TimeSpan.FromSeconds(2); Actual: 1999.4092" by waiting slightly less than 2 seconds
+            // Not sure what causes it, but either Task.Delay sometimes doesn't wait quite long enough or there is some clock skew.
+            TimeSpan roundedElapsedSpan = sw.Elapsed.RoundSeconds(digits: 1);
+            Assert.True(roundedElapsedSpan >= TimeSpan.FromSeconds(2), $"Expected roundedElapsedSpan >= TimeSpan.FromSeconds(2); Actual: {roundedElapsedSpan.TotalSeconds}");
         }
 
         [Theory]
@@ -313,38 +321,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         public void IsNullable_ReturnsExpectedResult(Type type, bool expected)
         {
             Assert.Equal(expected, Utility.IsNullable(type));
-        }
-
-        [Theory]
-        [InlineData("TEST-FUNCTIONS--", "test-functions")]
-        [InlineData("TEST-FUNCTIONS-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX", "test-functions-xxxxxxxxxxxxxxxxx")]
-        [InlineData("TEST-FUNCTIONS-XXXXXXXXXXXXXXXX-XXXX", "test-functions-xxxxxxxxxxxxxxxx")] /* 32nd character is a '-' */
-        [InlineData(null, null)]
-        public void GetDefaultHostId_AzureHost_ReturnsExpectedResult(string input, string expected)
-        {
-            var config = new ScriptHostConfiguration();
-            var scriptSettingsManagerMock = new Mock<ScriptSettingsManager>(MockBehavior.Strict);
-            scriptSettingsManagerMock.SetupGet(p => p.AzureWebsiteUniqueSlotName).Returns(() => input);
-
-            string hostId = Utility.GetDefaultHostId(scriptSettingsManagerMock.Object, config);
-            Assert.Equal(expected, hostId);
-        }
-
-        [Fact]
-        public void GetDefaultHostId_SelfHost_ReturnsExpectedResult()
-        {
-            var config = new ScriptHostConfiguration
-            {
-                IsSelfHost = true,
-                RootScriptPath = @"c:\testing\FUNCTIONS-TEST\test$#"
-            };
-            var scriptSettingsManagerMock = new Mock<ScriptSettingsManager>(MockBehavior.Strict);
-
-            string hostId = Utility.GetDefaultHostId(scriptSettingsManagerMock.Object, config);
-            string sanitizedMachineName = Environment.MachineName
-                    .Where(char.IsLetterOrDigit)
-                    .Aggregate(new StringBuilder(), (b, c) => b.Append(c)).ToString().ToLowerInvariant();
-            Assert.Equal($"{sanitizedMachineName}-789851553", hostId);
         }
     }
 }

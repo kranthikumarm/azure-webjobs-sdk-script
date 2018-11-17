@@ -2,13 +2,17 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Host;
+using Microsoft.Azure.WebJobs.Host.Executors;
 using Microsoft.Azure.WebJobs.Host.Loggers;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
 using Microsoft.WindowsAzure.Storage;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
@@ -19,40 +23,54 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         private const string Key = "metadata";
 
         private readonly ILogWriter _writer;
-
-        private readonly Func<string, FunctionDescriptor> _funcLookup;
-
+        private readonly IProxyMetadataManager _proxyMetadataManager;
         private readonly IMetricsLogger _metrics;
+        private readonly IFunctionMetadataManager _metadataManager;
 
         public FunctionInstanceLogger(
-            Func<string, FunctionDescriptor> funcLookup,
+            IFunctionMetadataManager metadataManager,
+            IProxyMetadataManager proxyMetadataManager,
             IMetricsLogger metrics,
-            string hostName,
-            string accountConnectionString, // May be null
-            TraceWriter trace) : this(funcLookup, metrics)
+            IHostIdProvider hostIdProvider,
+            IConfiguration configuration,
+            ILoggerFactory loggerFactory)
+            : this(metadataManager, proxyMetadataManager, metrics)
         {
-            if (trace == null)
+            if (hostIdProvider == null)
             {
-                throw new ArgumentNullException(nameof(trace));
+                throw new ArgumentNullException(nameof(hostIdProvider));
             }
 
+            if (configuration == null)
+            {
+                throw new ArgumentNullException(nameof(configuration));
+            }
+
+            if (loggerFactory == null)
+            {
+                throw new ArgumentNullException(nameof(loggerFactory));
+            }
+
+            string accountConnectionString = configuration.GetWebJobsConnectionString(ConnectionStringNames.Dashboard);
             if (accountConnectionString != null)
             {
                 CloudStorageAccount account = CloudStorageAccount.Parse(accountConnectionString);
                 var client = account.CreateCloudTableClient();
                 var tableProvider = LogFactory.NewLogTableProvider(client);
 
+                ILogger logger = loggerFactory.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
+
+                string hostId = hostIdProvider.GetHostIdAsync(CancellationToken.None).GetAwaiter().GetResult() ?? "default";
                 string containerName = Environment.MachineName;
-                this._writer = LogFactory.NewWriter(hostName, containerName, tableProvider, (e) => OnException(e, trace));
+                _writer = LogFactory.NewWriter(hostId, containerName, tableProvider, (e) => OnException(e, logger));
             }
         }
 
-        internal FunctionInstanceLogger(
-            Func<string, FunctionDescriptor> funcLookup,
-            IMetricsLogger metrics)
+        internal FunctionInstanceLogger(IFunctionMetadataManager metadataManager, IProxyMetadataManager proxyMetadataManager, IMetricsLogger metrics)
         {
-            _metrics = metrics;
-            _funcLookup = funcLookup;
+            _metrics = metrics ?? throw new ArgumentNullException(nameof(metrics));
+            _proxyMetadataManager = proxyMetadataManager ?? throw new ArgumentNullException(nameof(proxyMetadataManager));
+            _metadataManager = metadataManager ?? throw new ArgumentNullException(nameof(metadataManager));
         }
 
         public async Task AddAsync(FunctionInstanceLogEntry item, CancellationToken cancellationToken = default(CancellationToken))
@@ -72,15 +90,14 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
                 if (state == null)
                 {
                     string shortName = Utility.GetFunctionShortName(item.FunctionName);
+                    FunctionMetadata function = GetFunctionMetadata(shortName);
 
-                    FunctionDescriptor descr = _funcLookup(shortName);
-                    if (descr == null)
+                    if (function == null)
                     {
                         // This exception will cause the function to not get executed.
                         throw new InvalidOperationException($"Missing function.json for '{shortName}'.");
                     }
-                    FunctionLogger logInfo = descr.Invoker.LogInfo;
-                    state = new FunctionInstanceMonitor(descr.Metadata, _metrics, item.FunctionInstanceId, logInfo);
+                    state = new FunctionInstanceMonitor(function, _metrics, item.FunctionInstanceId);
 
                     item.Properties[Key] = state;
 
@@ -105,6 +122,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             }
         }
 
+        private FunctionMetadata GetFunctionMetadata(string functionName)
+        {
+            FunctionMetadata GetMetadataFromCollection(IEnumerable<FunctionMetadata> functions)
+            {
+                return functions.FirstOrDefault(p => string.Equals(p.Name, functionName, StringComparison.OrdinalIgnoreCase));
+            }
+
+            return GetMetadataFromCollection(_metadataManager.Functions)
+                ?? GetMetadataFromCollection(_proxyMetadataManager.ProxyMetadata.Functions);
+        }
+
         public Task FlushAsync(CancellationToken cancellationToken = default(CancellationToken))
         {
             if (_writer == null)
@@ -114,10 +142,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             return _writer.FlushAsync();
         }
 
-        public static void OnException(Exception exception, TraceWriter trace)
+        public static void OnException(Exception exception, ILogger logger)
         {
             string errorString = $"Error writing logs to table storage: {exception.ToString()}";
-            trace.Error(errorString, exception);
+            logger.LogError(errorString, exception);
         }
     }
 }

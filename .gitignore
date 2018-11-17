@@ -2,6 +2,8 @@ bin
 obj
 csx
 .vs
+.vscode
+.DS_Store
 edge
 Publish
 
@@ -10,10 +12,15 @@ Publish
 *.cscfg
 *.Cache
 msbuild.log
+package-lock.json
+**/Properties/launchSettings.json
+**/project.assets.json
 
 /packages
+tools/ExtensionsMetadataGenerator/packages
 /TestResults
 
 /tools/NuGet.exe
 /node_modules
 /.output
+/buildoutput
