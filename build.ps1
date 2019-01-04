@@ -1,8 +1,13 @@
 ﻿param (
   [string]$buildNumber = "0",
   [string]$extensionVersion = "2.0.$buildNumber",
-  [bool]$includeVersion = $true
+  [bool]$includeSuffix = $true
 )
+
+if ($includeSuffix)
+{
+    $extensionVersion += "-prerelease"
+}
 
 $currentDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildOutput = Join-Path $currentDir "buildoutput"
@@ -256,14 +261,18 @@ function cleanExtension([string] $bitness) {
     Remove-Item -Recurse -Force "$privateSiteExtensionPath\$bitness\runtimes\linux" -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force "$privateSiteExtensionPath\$bitness\runtimes\osx" -ErrorAction SilentlyContinue
 
-    Get-ChildItem "$privateSiteExtensionPath\$bitness\workers\node\grpc\src\node\extension_binary" | 
+    Get-ChildItem "$privateSiteExtensionPath\$bitness\workers\node\grpc\src\node\extension_binary" -ErrorAction SilentlyContinue | 
     Foreach-Object {
         if (-Not ($_.FullName -Match "win32")) {
             Remove-Item -Recurse -Force $_.FullName
         }
     }
-}
 
+    $keepRuntimes = @('win', 'win-x86', 'win10-x86')
+    Get-ChildItem "$privateSiteExtensionPath\$bitness\workers\powershell\runtimes" -Exclude $keepRuntimes -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+}
+  
 dotnet --version
 dotnet build .\WebJobs.Script.sln -v q /p:BuildNumber="$buildNumber"
 
@@ -274,12 +283,8 @@ $projects =
   
 foreach ($project in $projects)
 {
-  $cmd = "pack", "src\$project\$project.csproj", "-o", "..\..\buildoutput", "--no-build"
-  
-  if ($includeVersion)
-  {
-    $cmd += "--version-suffix", "-$buildNumber"
-  }
+
+  $cmd = "pack", "src\$project\$project.csproj", "-o", "..\..\buildoutput", "--no-build" , "-p:PackageVersion=$extensionVersion"
   
   & dotnet $cmd  
 }
