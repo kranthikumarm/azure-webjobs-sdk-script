@@ -19,11 +19,13 @@ using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
 using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using HttpHandler = Microsoft.Azure.WebJobs.IAsyncConverter<System.Net.Http.HttpRequestMessage, System.Net.Http.HttpResponseMessage>;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
@@ -41,6 +43,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
         private readonly IWebFunctionsManager _functionsManager;
         private readonly IEnvironment _environment;
         private readonly IScriptHostManager _scriptHostManager;
+        private readonly IFunctionsSyncManager _functionsSyncManager;
 
         public HostController(IOptions<ScriptApplicationHostOptions> applicationHostOptions,
             IOptions<JobHostOptions> hostOptions,
@@ -48,7 +51,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             IAuthorizationService authorizationService,
             IWebFunctionsManager functionsManager,
             IEnvironment environment,
-            IScriptHostManager scriptHostManager)
+            IScriptHostManager scriptHostManager,
+            IFunctionsSyncManager functionsSyncManager)
         {
             _applicationHostOptions = applicationHostOptions;
             _hostOptions = hostOptions;
@@ -57,6 +61,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             _functionsManager = functionsManager;
             _environment = environment;
             _scriptHostManager = scriptHostManager;
+            _functionsSyncManager = functionsSyncManager;
         }
 
         [HttpGet]
@@ -90,8 +95,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
         [HttpPost]
         [Route("admin/host/ping")]
         [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
-        public IActionResult Ping()
+        public IActionResult Ping([FromServices] IScriptHostManager scriptHostManager)
         {
+            var pingStatus = new JObject
+            {
+                { "hostState", scriptHostManager.State.ToString() }
+            };
+
+            string message = $"Ping Status: {pingStatus.ToString()}";
+            _logger.Log(LogLevel.Debug, new EventId(0, "PingStatus"), message);
+
             return Ok();
         }
 
@@ -148,15 +161,15 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
 
         [HttpPost]
         [Route("admin/host/synctriggers")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
         public async Task<IActionResult> SyncTriggers()
         {
-            (var success, var error) = await _functionsManager.TrySyncTriggers();
+            var result = await _functionsSyncManager.TrySyncTriggersAsync();
 
             // Return a dummy body to make it valid in ARM template action evaluation
-            return success
+            return result.Success
                 ? Ok(new { status = "success" })
-                : StatusCode(StatusCodes.Status500InternalServerError, new { status = error });
+                : StatusCode(StatusCodes.Status500InternalServerError, new { status = result.Error });
         }
 
         [HttpPost]
@@ -217,8 +230,29 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             return Accepted();
         }
 
+        /// <summary>
+        /// This endpoint generates a temporary x-ms-site-restricted-token for core tool
+        /// to access KuduLite zipdeploy endpoint in Linux Consumption
+        /// </summary>
+        /// <returns>
+        /// 200 on token generated
+        /// 400 on non-Linux container environment
+        /// </returns>
         [HttpGet]
-        [HttpPost]
+        [Route("admin/host/token")]
+        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
+        public IActionResult GetAdminToken()
+        {
+            if (!_environment.IsLinuxContainerEnvironment())
+            {
+                return BadRequest("Endpoint is only available when running in Linux Container");
+            }
+
+            string requestHeaderToken = SimpleWebTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
+            return Ok(requestHeaderToken);
+        }
+
+        [AcceptVerbs("GET", "POST", "DELETE")]
         [Authorize(AuthenticationSchemes = AuthLevelAuthenticationDefaults.AuthenticationScheme)]
         [Route("runtime/webhooks/{name}/{*extra}")]
         [RequiresRunningHost]

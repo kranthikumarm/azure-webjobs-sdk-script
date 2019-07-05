@@ -6,9 +6,12 @@ using System.Net.Http;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Middleware;
 using Microsoft.Azure.WebJobs.Script.Rpc;
 using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
 using Microsoft.Azure.WebJobs.Script.WebHost.ContainerManagement;
+using Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.WebHost.Middleware;
@@ -58,6 +61,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public static void AddWebJobsScriptHost(this IServiceCollection services, IConfiguration configuration)
         {
+            services.AddHttpContextAccessor();
             services.AddWebJobsScriptHostRouting();
             services.AddMvc()
                 .AddXmlDataContractSerializerFormatters();
@@ -67,8 +71,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             services.AddSingleton<IScriptHostManager>(s => s.GetRequiredService<WebJobsScriptHostService>());
             services.AddSingleton<IScriptWebHostEnvironment, ScriptWebHostEnvironment>();
-            services.AddSingleton<IStandbyManager, StandbyManager>();
+            services.TryAddSingleton<IStandbyManager, StandbyManager>();
             services.TryAddSingleton<IScriptHostBuilder, DefaultScriptHostBuilder>();
+            services.AddSingleton<IMetricsLogger, WebHostMetricsLogger>();
 
             // Linux container services
             services.AddLinuxContainerServices();
@@ -81,7 +86,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 var environment = p.GetService<IEnvironment>();
                 if (environment.IsLinuxContainerEnvironment())
                 {
-                    return new LinuxContainerEventGenerator();
+                    return new LinuxContainerEventGenerator(environment);
                 }
                 else if (SystemEnvironment.Instance.IsLinuxAppServiceEnvironment())
                 {
@@ -94,12 +99,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             });
 
             // Management services
+            services.AddSingleton<IFunctionsSyncManager, FunctionsSyncManager>();
             services.AddSingleton<IWebFunctionsManager, WebFunctionsManager>();
             services.AddSingleton<IInstanceManager, InstanceManager>();
             services.AddSingleton(_ => new HttpClient());
+            services.AddSingleton<HostNameProvider>();
             services.AddSingleton<IFileSystem>(_ => FileUtility.Instance);
             services.AddTransient<VirtualFileSystem>();
             services.AddTransient<VirtualFileSystemMiddleware>();
+
+            // Logging and diagnostics
+            services.AddSingleton<IMetricsLogger, WebHostMetricsLogger>();
 
             // Secret management
             services.TryAddSingleton<ISecretManagerProvider, DefaultSecretManagerProvider>();
@@ -113,19 +123,23 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             services.AddSingleton<IHostedService>(s => s.GetRequiredService<WebJobsScriptHostService>());
 
             // Configuration
-            services.TryAddEnumerable(ServiceDescriptor.Singleton<IConfigureOptions<ScriptApplicationHostOptions>, ScriptApplicationHostOptionsSetup>());
+            services.ConfigureOptions<ScriptApplicationHostOptionsSetup>();
+            services.ConfigureOptions<StandbyOptionsSetup>();
             services.ConfigureOptions<LanguageWorkerOptionsSetup>();
+
+            services.TryAddSingleton<IDependencyValidator, DependencyValidator>();
+            services.TryAddSingleton<IJobHostMiddlewarePipeline>(s => DefaultMiddlewarePipeline.Empty);
         }
 
         private static void AddStandbyServices(this IServiceCollection services)
         {
-            services.AddSingleton<IOptionsChangeTokenSource<ScriptApplicationHostOptions>, StandbyChangeTokenSource>();
+            services.AddSingleton<IOptionsChangeTokenSource<StandbyOptions>, StandbyChangeTokenSource>();
 
             // Core script host service
             services.AddSingleton<IHostedService>(p =>
             {
-                var hostEnvironment = p.GetService<IScriptWebHostEnvironment>();
-                if (hostEnvironment.InStandbyMode)
+                var standbyOptions = p.GetService<IOptionsMonitor<StandbyOptions>>();
+                if (standbyOptions.CurrentValue.InStandbyMode)
                 {
                     var standbyManager = p.GetService<IStandbyManager>();
                     return new StandbyInitializationService(standbyManager);

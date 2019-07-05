@@ -21,9 +21,11 @@ using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
-    public class FunctionInvokerBaseTests
+    public class FunctionInvokerBaseTests : IDisposable
     {
         private MockInvoker _invoker;
+        private IHost _host;
+        private ScriptHost _scriptHost;
         private TestMetricsLogger _metricsLogger;
         private TestLoggerProvider _testLoggerProvider;
 
@@ -51,7 +53,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             });
             metadata.Bindings.Add(BindingMetadata.Create(binding));
 
-            var host = new HostBuilder()
+            _host = new HostBuilder()
                 .ConfigureDefaultTestWebScriptHost()
                 .ConfigureServices(s =>
                 {
@@ -60,10 +62,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 })
                 .Build();
 
-            var scriptHost = host.GetScriptHost();
-            scriptHost.InitializeAsync().Wait();
+            _scriptHost = _host.GetScriptHost();
+            _scriptHost.InitializeAsync().Wait();
 
-            _invoker = new MockInvoker(scriptHost, _metricsLogger, metadata, loggerFactory);
+            _invoker = new MockInvoker(_scriptHost, _metricsLogger, metadata, loggerFactory);
         }
 
         [Fact]
@@ -130,6 +132,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Same(startedEvent, completedStartEvent);
             Assert.True(completedStartEvent.Success);
 
+            // verify invoke failed event
+            Assert.False(string.IsNullOrEmpty(_metricsLogger.LoggedEvents.FirstOrDefault(e => e == MetricEventNames.FunctionInvokeSucceeded)));
+
             // verify latency event
             var startLatencyEvent = _metricsLogger.EventsBegan.ElementAt(0);
             Assert.Equal($"{MetricEventNames.FunctionInvokeLatency}_testfunction", startLatencyEvent);
@@ -184,11 +189,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Assert.Same(startedEvent, completedStartEvent);
             Assert.False(completedStartEvent.Success);
 
+            // verify invoke failed event
+            Assert.False(string.IsNullOrEmpty(_metricsLogger.LoggedEvents.FirstOrDefault(e => e == MetricEventNames.FunctionInvokeFailed)));
+
             // verify latency event
             var startLatencyEvent = _metricsLogger.EventsBegan.ElementAt(0);
             Assert.Equal($"{MetricEventNames.FunctionInvokeLatency}_testfunction", startLatencyEvent);
             var completedLatencyEvent = _metricsLogger.EventsEnded.ElementAt(0);
             Assert.Equal(startLatencyEvent, completedLatencyEvent);
+        }
+
+        protected virtual void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                _host?.Dispose();
+            }
+        }
+
+        public void Dispose()
+        {
+            Dispose(true);
         }
 
         private class MockInvoker : FunctionInvokerBase

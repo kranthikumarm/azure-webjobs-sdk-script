@@ -2,21 +2,27 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using System.Threading.Tasks.Dataflow;
+using Microsoft.Azure.WebJobs.Script.Description;
 
 namespace Microsoft.Azure.WebJobs.Script.Rpc
 {
-    public delegate ILanguageWorkerChannel CreateChannel(string language, IObservable<FunctionRegistrationContext> registrations, int attemptCount);
-
-    public interface ILanguageWorkerChannel : IDisposable
+    public interface ILanguageWorkerChannel
     {
         string Id { get; }
 
-        WorkerConfig Config { get; }
+        IDictionary<string, BufferBlock<ScriptInvocationContext>> FunctionInputBuffers { get; }
 
-        void RegisterFunctions(IObservable<FunctionRegistrationContext> functionRegistrations);
+        LanguageWorkerChannelState State { get; }
 
-        void SendFunctionEnvironmentReloadRequest();
+        void SetupFunctionInvocationBuffers(IEnumerable<FunctionMetadata> functions);
 
-        void StartWorkerProcess();
+        void SendFunctionLoadRequests();
+
+        Task SendFunctionEnvironmentReloadRequest();
+
+        Task StartWorkerProcessAsync();
     }
 }

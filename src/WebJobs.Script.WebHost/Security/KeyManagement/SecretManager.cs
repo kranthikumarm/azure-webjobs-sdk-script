@@ -4,12 +4,16 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.KeyVault.Models;
 using Microsoft.Azure.WebJobs.Script.Config;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Properties;
 using Microsoft.Extensions.Logging;
 
@@ -21,30 +25,35 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private readonly IKeyValueConverterFactory _keyValueConverterFactory;
         private readonly ILogger _logger;
         private readonly ISecretsRepository _repository;
+        private readonly HostNameProvider _hostNameProvider;
         private HostSecretsInfo _hostSecrets;
         private SemaphoreSlim _hostSecretsLock = new SemaphoreSlim(1, 1);
+        private IMetricsLogger _metricsLogger;
+        private string _repositoryClassName;
 
         // for testing
         public SecretManager()
         {
         }
 
-        public SecretManager(ISecretsRepository repository, ILogger logger, bool createHostSecretsIfMissing = false)
-            : this(repository, new DefaultKeyValueConverterFactory(), logger, createHostSecretsIfMissing)
+        public SecretManager(ISecretsRepository repository, ILogger logger, IMetricsLogger metricsLogger, HostNameProvider hostNameProvider, bool createHostSecretsIfMissing = false)
+            : this(repository, new DefaultKeyValueConverterFactory(repository.IsEncryptionSupported), logger, metricsLogger, hostNameProvider, createHostSecretsIfMissing)
         {
         }
 
-        public SecretManager(ISecretsRepository repository, IKeyValueConverterFactory keyValueConverterFactory, ILogger logger, bool createHostSecretsIfMissing = false)
+        public SecretManager(ISecretsRepository repository, IKeyValueConverterFactory keyValueConverterFactory, ILogger logger, IMetricsLogger metricsLogger, HostNameProvider hostNameProvider, bool createHostSecretsIfMissing = false)
         {
             _repository = repository;
             _keyValueConverterFactory = keyValueConverterFactory;
             _repository.SecretsChanged += OnSecretsChanged;
             _logger = logger;
+            _metricsLogger = metricsLogger ?? throw new ArgumentNullException(nameof(metricsLogger));
+            _repositoryClassName = _repository.GetType().Name.ToLower();
+            _hostNameProvider = hostNameProvider;
 
             if (createHostSecretsIfMissing)
             {
-                // The SecretManager implementation of GetHostSecrets will
-                // create a host secret if one is not present.
+                // GetHostSecrets will create host secrets if not present
                 GetHostSecretsAsync().GetAwaiter().GetResult();
             }
         }
@@ -66,201 +75,217 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public async virtual Task<HostSecretsInfo> GetHostSecretsAsync()
         {
-            if (_hostSecrets == null)
+            using (_metricsLogger.LatencyEvent(GetMetricEventName(MetricEventNames.SecretManagerGetHostSecrets)))
             {
-                HostSecrets hostSecrets;
-                // Allow only one thread to modify the secrets
-                await _hostSecretsLock.WaitAsync();
-                try
+                if (_hostSecrets == null)
                 {
-                    hostSecrets = await LoadSecretsAsync<HostSecrets>();
-
-                    if (hostSecrets == null)
-                    {
-                        // host secrets do not yet exist so generate them
-                        _logger.LogDebug(Resources.TraceHostSecretGeneration);
-                        hostSecrets = GenerateHostSecrets();
-                        await PersistSecretsAsync(hostSecrets);
-                    }
-
+                    HostSecrets hostSecrets;
+                    // Allow only one thread to modify the secrets
+                    await _hostSecretsLock.WaitAsync();
                     try
                     {
-                        // Host secrets will be in the original persisted state at this point (e.g. encrypted),
-                        // so we read the secrets running them through the appropriate readers
-                        hostSecrets = ReadHostSecrets(hostSecrets);
-                    }
-                    catch (CryptographicException)
-                    {
-                        _logger?.LogDebug(Resources.TraceNonDecryptedHostSecretRefresh);
-                        await PersistSecretsAsync(hostSecrets, null, true);
-                        hostSecrets = GenerateHostSecrets(hostSecrets);
-                        await RefreshSecretsAsync(hostSecrets);
-                    }
+                        hostSecrets = await LoadSecretsAsync<HostSecrets>();
 
-                    // If the persistence state of any of our secrets is stale (e.g. the encryption key has been rotated), update
-                    // the state and persist the secrets
-                    if (hostSecrets.HasStaleKeys)
-                    {
-                        _logger.LogDebug(Resources.TraceStaleHostSecretRefresh);
-                        await RefreshSecretsAsync(hostSecrets);
-                    }
+                        if (hostSecrets == null)
+                        {
+                            // host secrets do not yet exist so generate them
+                            _logger.LogDebug(Resources.TraceHostSecretGeneration);
+                            hostSecrets = GenerateHostSecrets();
+                            await PersistSecretsAsync(hostSecrets);
+                        }
 
-                    _hostSecrets = new HostSecretsInfo
+                        try
+                        {
+                            // Host secrets will be in the original persisted state at this point (e.g. encrypted),
+                            // so we read the secrets running them through the appropriate readers
+                            hostSecrets = ReadHostSecrets(hostSecrets);
+                        }
+                        catch (CryptographicException ex)
+                        {
+                            string message = string.Format(Resources.TraceNonDecryptedHostSecretRefresh, ex);
+                            _logger?.LogDebug(message);
+                            await PersistSecretsAsync(hostSecrets, null, true);
+                            hostSecrets = GenerateHostSecrets(hostSecrets);
+                            await RefreshSecretsAsync(hostSecrets);
+                        }
+
+                        // If the persistence state of any of our secrets is stale (e.g. the encryption key has been rotated), update
+                        // the state and persist the secrets
+                        if (hostSecrets.HasStaleKeys)
+                        {
+                            _logger.LogDebug(Resources.TraceStaleHostSecretRefresh);
+                            await RefreshSecretsAsync(hostSecrets);
+                        }
+
+                        _hostSecrets = new HostSecretsInfo
+                        {
+                            MasterKey = hostSecrets.MasterKey.Value,
+                            FunctionKeys = hostSecrets.FunctionKeys.ToDictionary(s => s.Name, s => s.Value),
+                            SystemKeys = hostSecrets.SystemKeys.ToDictionary(s => s.Name, s => s.Value)
+                        };
+                    }
+                    finally
                     {
-                        MasterKey = hostSecrets.MasterKey.Value,
-                        FunctionKeys = hostSecrets.FunctionKeys.ToDictionary(s => s.Name, s => s.Value),
-                        SystemKeys = hostSecrets.SystemKeys.ToDictionary(s => s.Name, s => s.Value)
-                    };
+                        _hostSecretsLock.Release();
+                    }
                 }
-                finally
-                {
-                    _hostSecretsLock.Release();
-                }
+
+                return _hostSecrets;
             }
-
-            return _hostSecrets;
         }
 
         public async virtual Task<IDictionary<string, string>> GetFunctionSecretsAsync(string functionName, bool merged = false)
         {
-            if (string.IsNullOrEmpty(functionName))
+            using (_metricsLogger.LatencyEvent(GetMetricEventName(MetricEventNames.SecretManagerGetFunctionSecrets), functionName))
             {
-                throw new ArgumentNullException(nameof(functionName));
+                if (string.IsNullOrEmpty(functionName))
+                {
+                    throw new ArgumentNullException(nameof(functionName));
+                }
+
+                functionName = functionName.ToLowerInvariant();
+                Dictionary<string, string> functionSecrets;
+                _secretsMap.TryGetValue(functionName, out functionSecrets);
+
+                if (functionSecrets == null)
+                {
+                    FunctionSecrets secrets = await LoadFunctionSecretsAsync(functionName);
+                    if (secrets == null)
+                    {
+                        // no secrets exist for this function so generate them
+                        string message = string.Format(Resources.TraceFunctionSecretGeneration, functionName);
+                        _logger.LogDebug(message);
+                        secrets = GenerateFunctionSecrets();
+
+                        await PersistSecretsAsync(secrets, functionName);
+                    }
+
+                    try
+                    {
+                        // Read all secrets, which will run the keys through the appropriate readers
+                        secrets.Keys = secrets.Keys.Select(k => _keyValueConverterFactory.ReadKey(k)).ToList();
+                    }
+                    catch (CryptographicException ex)
+                    {
+                        string message = string.Format(Resources.TraceNonDecryptedFunctionSecretRefresh, functionName, ex);
+                        _logger?.LogDebug(message);
+                        await PersistSecretsAsync(secrets, functionName, true);
+                        secrets = GenerateFunctionSecrets(secrets);
+                        await RefreshSecretsAsync(secrets, functionName);
+                    }
+
+                    if (secrets.HasStaleKeys)
+                    {
+                        _logger.LogDebug(string.Format(Resources.TraceStaleFunctionSecretRefresh, functionName));
+                        await RefreshSecretsAsync(secrets, functionName);
+                    }
+
+                    Dictionary<string, string> result = secrets.Keys.ToDictionary(s => s.Name, s => s.Value);
+
+                    functionSecrets = _secretsMap.AddOrUpdate(functionName, result, (n, r) => result);
+                }
+
+                if (merged)
+                {
+                    // If merged is true, we combine function specific keys with host level function keys,
+                    // prioritizing function specific keys
+                    HostSecretsInfo hostSecrets = await GetHostSecretsAsync();
+                    Dictionary<string, string> hostFunctionSecrets = hostSecrets.FunctionKeys;
+
+                    functionSecrets = functionSecrets.Union(hostFunctionSecrets.Where(s => !functionSecrets.ContainsKey(s.Key)))
+                        .ToDictionary(kv => kv.Key, kv => kv.Value);
+                }
+
+                return functionSecrets;
             }
-
-            functionName = functionName.ToLowerInvariant();
-            Dictionary<string, string> functionSecrets;
-            _secretsMap.TryGetValue(functionName, out functionSecrets);
-
-            if (functionSecrets == null)
-            {
-                FunctionSecrets secrets = await LoadFunctionSecretsAsync(functionName);
-                if (secrets == null)
-                {
-                    // no secrets exist for this function so generate them
-                    string message = string.Format(Resources.TraceFunctionSecretGeneration, functionName);
-                    _logger.LogDebug(message);
-                    secrets = GenerateFunctionSecrets();
-
-                    await PersistSecretsAsync(secrets, functionName);
-                }
-
-                try
-                {
-                    // Read all secrets, which will run the keys through the appropriate readers
-                    secrets.Keys = secrets.Keys.Select(k => _keyValueConverterFactory.ReadKey(k)).ToList();
-                }
-                catch (CryptographicException)
-                {
-                    string message = string.Format(Resources.TraceNonDecryptedFunctionSecretRefresh, functionName);
-                    _logger?.LogDebug(message);
-                    await PersistSecretsAsync(secrets, functionName, true);
-                    secrets = GenerateFunctionSecrets(secrets);
-                    await RefreshSecretsAsync(secrets, functionName);
-                }
-
-                if (secrets.HasStaleKeys)
-                {
-                    _logger.LogDebug(string.Format(Resources.TraceStaleFunctionSecretRefresh, functionName));
-                    await RefreshSecretsAsync(secrets, functionName);
-                }
-
-                Dictionary<string, string> result = secrets.Keys.ToDictionary(s => s.Name, s => s.Value);
-
-                functionSecrets = _secretsMap.AddOrUpdate(functionName, result, (n, r) => result);
-            }
-
-            if (merged)
-            {
-                // If merged is true, we combine function specific keys with host level function keys,
-                // prioritizing function specific keys
-                HostSecretsInfo hostSecrets = await GetHostSecretsAsync();
-                Dictionary<string, string> hostFunctionSecrets = hostSecrets.FunctionKeys;
-
-                functionSecrets = functionSecrets.Union(hostFunctionSecrets.Where(s => !functionSecrets.ContainsKey(s.Key)))
-                    .ToDictionary(kv => kv.Key, kv => kv.Value);
-            }
-
-            return functionSecrets;
         }
 
         public async Task<KeyOperationResult> AddOrUpdateFunctionSecretAsync(string secretName, string secret, string keyScope, ScriptSecretsType secretsType)
         {
-            Func<ScriptSecrets> secretsFactory = null;
-
-            if (secretsType == ScriptSecretsType.Function)
+            using (_metricsLogger.LatencyEvent(GetMetricEventName(MetricEventNames.SecretManagerAddOrUpdateFunctionSecret), GetFunctionName(keyScope, secretsType)))
             {
-                secretsFactory = () => new FunctionSecrets(new List<Key>());
-            }
-            else if (secretsType == ScriptSecretsType.Host)
-            {
-                secretsType = ScriptSecretsType.Host;
-                secretsFactory = GenerateHostSecrets;
-            }
-            else
-            {
-                throw new NotSupportedException($"Secrets type {secretsType.ToString("G")} not supported.");
-            }
+                Func<ScriptSecrets> secretsFactory = null;
 
-            KeyOperationResult result = await AddOrUpdateSecretAsync(secretsType, keyScope, secretName, secret, secretsFactory);
+                if (secretsType == ScriptSecretsType.Function)
+                {
+                    secretsFactory = () => new FunctionSecrets(new List<Key>());
+                }
+                else if (secretsType == ScriptSecretsType.Host)
+                {
+                    secretsType = ScriptSecretsType.Host;
+                    secretsFactory = GenerateHostSecrets;
+                }
+                else
+                {
+                    throw new NotSupportedException($"Secrets type {secretsType.ToString("G")} not supported.");
+                }
 
-            _logger.LogInformation(string.Format(Resources.TraceAddOrUpdateFunctionSecret, secretsType, secretName, keyScope ?? "host", result.Result));
+                KeyOperationResult result = await AddOrUpdateSecretAsync(secretsType, keyScope, secretName, secret, secretsFactory);
 
-            return result;
+                _logger.LogInformation(string.Format(Resources.TraceAddOrUpdateFunctionSecret, secretsType, secretName, keyScope ?? "host", result.Result));
+
+                return result;
+            }
         }
 
         public async Task<KeyOperationResult> SetMasterKeyAsync(string value = null)
         {
-            HostSecrets secrets = await LoadSecretsAsync<HostSecrets>();
-
-            if (secrets == null)
+            using (_metricsLogger.LatencyEvent(GetMetricEventName(MetricEventNames.SecretManagerSetMasterKey)))
             {
-                secrets = GenerateHostSecrets();
+                HostSecrets secrets = await LoadSecretsAsync<HostSecrets>();
+
+                if (secrets == null)
+                {
+                    secrets = GenerateHostSecrets();
+                }
+
+                OperationResult result;
+                string masterKey;
+                if (value == null)
+                {
+                    // Generate a new secret (clear)
+                    masterKey = GenerateSecret();
+                    result = OperationResult.Created;
+                }
+                else
+                {
+                    // Use the provided secret
+                    masterKey = value;
+                    result = OperationResult.Updated;
+                }
+
+                // Creates a key with the new master key (which will be encrypted, if required)
+                secrets.MasterKey = CreateKey(ScriptConstants.DefaultMasterKeyName, masterKey);
+
+                await PersistSecretsAsync(secrets);
+
+                _logger.LogInformation(string.Format(Resources.TraceMasterKeyCreatedOrUpdated, result));
+
+                return new KeyOperationResult(masterKey, result);
             }
-
-            OperationResult result;
-            string masterKey;
-            if (value == null)
-            {
-                // Generate a new secret (clear)
-                masterKey = GenerateSecret();
-                result = OperationResult.Created;
-            }
-            else
-            {
-                // Use the provided secret
-                masterKey = value;
-                result = OperationResult.Updated;
-            }
-
-            // Creates a key with the new master key (which will be encrypted, if required)
-            secrets.MasterKey = CreateKey(ScriptConstants.DefaultMasterKeyName, masterKey);
-
-            await PersistSecretsAsync(secrets);
-
-            _logger.LogInformation(string.Format(Resources.TraceMasterKeyCreatedOrUpdated, result));
-
-            return new KeyOperationResult(masterKey, result);
         }
 
         public async Task<bool> DeleteSecretAsync(string secretName, string keyScope, ScriptSecretsType secretsType)
         {
-            bool deleted = await ModifyFunctionSecretAsync(secretsType, keyScope, secretName, (secrets, key) =>
+            using (_metricsLogger.LatencyEvent(GetMetricEventName(MetricEventNames.SecretManagerDeleteSecret), GetFunctionName(keyScope, secretsType)))
+            {
+                bool deleted = await ModifyFunctionSecretAsync(secretsType, keyScope, secretName, (secrets, key) =>
             {
                 secrets?.RemoveKey(key, keyScope);
                 return secrets;
             });
 
-            if (deleted)
-            {
-                string target = secretsType == ScriptSecretsType.Function
-                    ? $"Function ('{keyScope}')"
-                    : $"Host (scope: '{keyScope}')";
+                if (deleted)
+                {
+                    string target = secretsType == ScriptSecretsType.Function
+                        ? $"Function ('{keyScope}')"
+                        : $"Host (scope: '{keyScope}')";
 
-                _logger.LogInformation(string.Format(Resources.TraceSecretDeleted, target, secretName));
+                    _logger.LogInformation(string.Format(Resources.TraceSecretDeleted, target, secretName));
+                }
+
+                return deleted;
             }
-
-            return deleted;
         }
 
         private async Task<KeyOperationResult> AddOrUpdateSecretAsync(ScriptSecretsType secretsType, string keyScope,
@@ -291,7 +316,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 }
 
                 return secrets;
-            }, secretsFactory);
+            }, secretsFactory).ContinueWith(t =>
+            {
+                if (t.IsFaulted && t.Exception.InnerException is KeyVaultErrorException)
+                {
+                    result = OperationResult.Forbidden;
+                }
+            });
 
             return new KeyOperationResult(secret, result);
         }
@@ -337,28 +368,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         private Task<FunctionSecrets> LoadFunctionSecretsAsync(string functionName)
             => LoadSecretsAsync<FunctionSecrets>(functionName);
 
-        private Task<ScriptSecrets> LoadSecretsAsync(ScriptSecretsType secretsType, string keyScope)
-            => LoadSecretsAsync(secretsType, keyScope, s => ScriptSecretSerializer.DeserializeSecrets(secretsType, s));
-
         private async Task<T> LoadSecretsAsync<T>(string keyScope = null) where T : ScriptSecrets
         {
             ScriptSecretsType type = GetSecretsType<T>();
 
-            var result = await LoadSecretsAsync(type, keyScope, ScriptSecretSerializer.DeserializeSecrets<T>);
+            var result = await LoadSecretsAsync(type, keyScope);
 
             return result as T;
         }
 
-        private async Task<ScriptSecrets> LoadSecretsAsync(ScriptSecretsType type, string keyScope, Func<string, ScriptSecrets> deserializationHandler)
+        private async Task<ScriptSecrets> LoadSecretsAsync(ScriptSecretsType type, string keyScope)
         {
-            string secretsJson = await _repository.ReadAsync(type, keyScope).ConfigureAwait(false);
-
-            if (!string.IsNullOrEmpty(secretsJson))
-            {
-                return deserializationHandler(secretsJson);
-            }
-
-            return null;
+            return await _repository.ReadAsync(type, keyScope).ConfigureAwait(false);
         }
 
         private static ScriptSecretsType GetSecretsType<T>() where T : ScriptSecrets
@@ -430,23 +451,35 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         private async Task PersistSecretsAsync<T>(T secrets, string keyScope = null, bool isNonDecryptable = false) where T : ScriptSecrets
         {
+            if (secrets != null)
+            {
+                secrets.HostName = _hostNameProvider.Value;
+            }
+
             ScriptSecretsType secretsType = secrets.SecretsType;
-            string secretsContent = ScriptSecretSerializer.SerializeSecrets<T>(secrets);
             if (isNonDecryptable)
             {
+                string decryptionKey = SystemEnvironment.Instance.GetEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey);
+                if (!string.IsNullOrEmpty(decryptionKey))
+                {
+                    SHA256Managed hash = new SHA256Managed();
+                    byte[] hashBytes = hash.ComputeHash(Encoding.UTF8.GetBytes(decryptionKey));
+                    secrets.DecryptionKeyId = Convert.ToBase64String(hashBytes);
+                }
+
                 string[] secretBackups = await _repository.GetSecretSnapshots(secrets.SecretsType, keyScope);
 
                 if (secretBackups.Length >= ScriptConstants.MaximumSecretBackupCount)
                 {
-                    string message = string.Format(Resources.ErrorTooManySecretBackups, ScriptConstants.MaximumSecretBackupCount, string.IsNullOrEmpty(keyScope) ? "host" : keyScope, await AnalyzeSnapshots<T>(secretBackups));
+                    string message = string.Format(Resources.ErrorTooManySecretBackups, ScriptConstants.MaximumSecretBackupCount, string.IsNullOrEmpty(keyScope) ? "host" : keyScope, await AnalyzeSnapshots(secretBackups));
                     _logger?.LogDebug(message);
                     throw new InvalidOperationException(message);
                 }
-                await _repository.WriteSnapshotAsync(secretsType, keyScope, secretsContent);
+                await _repository.WriteSnapshotAsync(secretsType, keyScope, secrets);
             }
             else
             {
-                await _repository.WriteAsync(secretsType, keyScope, secretsContent);
+                await _repository.WriteAsync(secretsType, keyScope, secrets);
             }
         }
 
@@ -497,21 +530,27 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             }
             else
             {
-                Dictionary<string, string> secrets;
-                _secretsMap.TryRemove(e.Name, out secrets);
+                if (string.IsNullOrEmpty(e.Name))
+                {
+                    _secretsMap.Clear();
+                }
+                else
+                {
+                    _secretsMap.TryRemove(e.Name, out _);
+                }
             }
         }
 
-        private async Task<string> AnalyzeSnapshots<T>(string[] secretBackups) where T : ScriptSecrets
+        private async Task<string> AnalyzeSnapshots(string[] secretBackups)
         {
             string analyzeResult = string.Empty;
             try
             {
-                List<T> shapShots = new List<T>();
+                List<ScriptSecrets> shapShots = new List<ScriptSecrets>();
                 foreach (string secretPath in secretBackups)
                 {
-                    string secretString = await _repository.ReadAsync(ScriptSecretsType.Function, Path.GetFileNameWithoutExtension(secretPath));
-                    shapShots.Add(ScriptSecretSerializer.DeserializeSecrets<T>(secretString));
+                    ScriptSecrets secrets = await _repository.ReadAsync(ScriptSecretsType.Function, Path.GetFileNameWithoutExtension(secretPath));
+                    shapShots.Add(secrets);
                 }
                 string[] hosts = shapShots.Select(x => x.HostName).Distinct().ToArray();
                 if (hosts.Length > 1)
@@ -528,19 +567,32 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public async Task PurgeOldSecretsAsync(string rootScriptPath, ILogger logger)
         {
-            if (!Directory.Exists(rootScriptPath))
+            using (_metricsLogger.LatencyEvent(GetMetricEventName(MetricEventNames.SecretManagerPurgeOldSecrets)))
             {
-                return;
+                if (!Directory.Exists(rootScriptPath))
+                {
+                    return;
+                }
+
+                // Create a lookup of all potential functions (whether they're valid or not)
+                // It is important that we determine functions based on the presence of a folder,
+                // not whether we've identified a valid function from that folder. This ensures
+                // that we don't delete logs/secrets for functions that transition into/out of
+                // invalid unparsable states.
+                var currentFunctions = Directory.EnumerateDirectories(rootScriptPath).Select(p => Path.GetFileName(p)).ToList();
+
+                await _repository.PurgeOldSecretsAsync(currentFunctions, logger);
             }
+        }
 
-            // Create a lookup of all potential functions (whether they're valid or not)
-            // It is important that we determine functions based on the presence of a folder,
-            // not whether we've identified a valid function from that folder. This ensures
-            // that we don't delete logs/secrets for functions that transition into/out of
-            // invalid unparsable states.
-            var currentFunctions = Directory.EnumerateDirectories(rootScriptPath).Select(p => Path.GetFileName(p)).ToList();
+        private string GetMetricEventName(string name)
+        {
+            return string.Format(CultureInfo.InvariantCulture, name, _repositoryClassName);
+        }
 
-            await _repository.PurgeOldSecretsAsync(currentFunctions, logger);
+        private string GetFunctionName(string keyScope, ScriptSecretsType secretsType)
+        {
+            return (secretsType == ScriptSecretsType.Function) ? keyScope : null;
         }
     }
 }

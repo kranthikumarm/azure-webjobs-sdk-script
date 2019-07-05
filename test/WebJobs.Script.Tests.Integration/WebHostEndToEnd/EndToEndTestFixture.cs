@@ -5,7 +5,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.BindingExtensions;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Models;
@@ -19,6 +21,8 @@ using Microsoft.WindowsAzure.Storage.Blob;
 using Microsoft.WindowsAzure.Storage.Queue;
 using Microsoft.WindowsAzure.Storage.Table;
 using Xunit;
+using Microsoft.Azure.WebJobs.Script.WebHost.Management;
+using Moq;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
@@ -58,6 +62,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public TestMetricsLogger MetricsLogger { get; private set; } = new TestMetricsLogger();
 
+        public Mock<IFunctionsSyncManager> FunctionsSyncManagerMock { get; private set; }
+
         protected virtual ExtensionPackageReference[] GetExtensionsToInstall()
         {
             return null;
@@ -77,22 +83,24 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     RootScriptPath = _copiedRootPath
                 });
 
-                var manager = new ExtensionsManager(options, NullLogger<ExtensionsManager>.Instance);
+                var manager = new ExtensionsManager(options, NullLogger<ExtensionsManager>.Instance, new TestExtensionBundleManager());
                 await manager.AddExtensions(extensionsToInstall);
             }
 
             string logPath = Path.Combine(Path.GetTempPath(), @"Functions");
+            if (!string.IsNullOrEmpty(_functionsWorkerRuntime))
+            {
+                Environment.SetEnvironmentVariable(LanguageWorkerConstants.FunctionWorkerRuntimeSettingName, _functionsWorkerRuntime);
+            }
+
+            FunctionsSyncManagerMock = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
+            FunctionsSyncManagerMock.Setup(p => p.TrySyncTriggersAsync(It.IsAny<bool>())).ReturnsAsync(new SyncTriggersResult { Success = true });
+
             Host = new TestFunctionHost(_copiedRootPath, logPath, webJobsBuilder =>
             {
                 webJobsBuilder.Services.AddSingleton<IMetricsLogger>(_ => MetricsLogger);
+                webJobsBuilder.Services.AddSingleton<IFunctionsSyncManager>(_ => FunctionsSyncManagerMock.Object);
                 ConfigureJobHost(webJobsBuilder);
-            },
-            configureAppConfiguration: s =>
-            {
-                s.AddInMemoryCollection(new Dictionary<string, string>()
-                {
-                    { LanguageWorkerConstants.FunctionWorkerRuntimeSettingName, _functionsWorkerRuntime }
-                });
             });
 
             string connectionString = Host.JobHostServices.GetService<IConfiguration>().GetWebJobsConnectionString(ConnectionStringNames.Storage);
@@ -207,6 +215,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             }
             Environment.SetEnvironmentVariable(LanguageWorkerConstants.FunctionWorkerRuntimeSettingName, string.Empty);
             return Task.CompletedTask;
+        }
+
+        private class TestExtensionBundleManager : IExtensionBundleManager
+        {
+            public Task<string> GetExtensionBundlePath(HttpClient httpClient = null) => null;
+
+            public Task<string> GetExtensionBundlePath() => null;
+
+            public bool IsExtensionBundleConfigured() => false;
+
         }
 
         private class TestEntity : TableEntity

@@ -3,14 +3,21 @@
 
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Configuration;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using Microsoft.WindowsAzure.Storage.Blob;
+using Newtonsoft.Json;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
 {
@@ -20,19 +27,59 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         private static HostAssignmentContext _assignmentContext;
 
         private readonly ILogger _logger;
+        private readonly IMetricsLogger _metricsLogger;
         private readonly IEnvironment _environment;
         private readonly IOptionsFactory<ScriptApplicationHostOptions> _optionsFactory;
         private readonly HttpClient _client;
         private readonly IScriptWebHostEnvironment _webHostEnvironment;
 
         public InstanceManager(IOptionsFactory<ScriptApplicationHostOptions> optionsFactory, HttpClient client, IScriptWebHostEnvironment webHostEnvironment,
-            IEnvironment environment, ILogger<InstanceManager> logger)
+            IEnvironment environment, ILogger<InstanceManager> logger, IMetricsLogger metricsLogger)
         {
             _client = client ?? throw new ArgumentNullException(nameof(client));
             _webHostEnvironment = webHostEnvironment ?? throw new ArgumentNullException(nameof(webHostEnvironment));
             _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _metricsLogger = metricsLogger;
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
             _optionsFactory = optionsFactory ?? throw new ArgumentNullException(nameof(optionsFactory));
+        }
+
+        public async Task<string> SpecializeMSISidecar(HostAssignmentContext context)
+        {
+            string endpoint;
+            var msiEnabled = context.IsMSIEnabled(out endpoint);
+
+            _logger.LogInformation($"MSI enabled status: {msiEnabled}");
+
+            if (msiEnabled)
+            {
+                using (_metricsLogger.LatencyEvent(MetricEventNames.LinuxContainerSpecializationMSIInit))
+                {
+                    var uri = new Uri(endpoint);
+                    var address = $"http://{uri.Host}:{uri.Port}{ScriptConstants.LinuxMSISpecializationStem}";
+
+                    _logger.LogDebug($"Specializing sidecar at {address}");
+
+                    var requestMessage = new HttpRequestMessage(HttpMethod.Post, address)
+                    {
+                        Content = new StringContent(JsonConvert.SerializeObject(context.MSIContext),
+                            Encoding.UTF8, "application/json")
+                    };
+
+                    var response = await _client.SendAsync(requestMessage);
+
+                    _logger.LogInformation($"Specialize MSI sidecar returned {response.StatusCode}");
+
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        var message = $"Specialize MSI sidecar call failed. StatusCode={response.StatusCode}";
+                        _logger.LogError(message);
+                        return message;
+                    }
+                }
+            }
+
+            return null;
         }
 
         public bool StartAssignment(HostAssignmentContext context)
@@ -80,21 +127,49 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         {
             _logger.LogInformation($"Validating host assignment context (SiteId: {assignmentContext.SiteId}, SiteName: '{assignmentContext.SiteName}')");
 
-            var zipUrl = assignmentContext.ZipUrl;
-            if (!string.IsNullOrEmpty(zipUrl))
+            string error = null;
+            HttpResponseMessage response = null;
+            try
             {
-                // make sure the zip uri is valid and accessible
-                var request = new HttpRequestMessage(HttpMethod.Head, zipUrl);
-                var response = await _client.SendAsync(request);
-                if (!response.IsSuccessStatusCode)
+                RunFromPackageContext pkgContext = assignmentContext.GetRunFromPkgContext();
+                _logger.LogInformation($"Will be using {pkgContext.EnvironmentVariableName} app setting as zip url");
+
+                if (pkgContext.IsScmRunFromPackage())
                 {
-                    string error = $"Invalid zip url specified (StatusCode: {response.StatusCode})";
-                    _logger.LogError(error);
-                    return error;
+                    // Not user assigned so limit validation
+                    return null;
+                }
+
+                var zipUrl = pkgContext.Url;
+                if (!string.IsNullOrEmpty(zipUrl))
+                {
+                    // make sure the zip uri is valid and accessible
+                    await Utility.InvokeWithRetriesAsync(async () =>
+                    {
+                        try
+                        {
+                            using (_metricsLogger.LatencyEvent(MetricEventNames.LinuxContainerSpecializationZipHead))
+                            {
+                                var request = new HttpRequestMessage(HttpMethod.Head, zipUrl);
+                                response = await _client.SendAsync(request);
+                                response.EnsureSuccessStatusCode();
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            _logger.LogError(e, $"{MetricEventNames.LinuxContainerSpecializationZipHead} failed");
+                            throw;
+                        }
+                    }, maxRetries: 2, retryInterval: TimeSpan.FromSeconds(0.3)); // Keep this less than ~1s total
                 }
             }
+            catch (Exception e)
+            {
+                error = $"Invalid zip url specified (StatusCode: {response?.StatusCode})";
+                _logger.LogError(e, "ValidateContext failed");
+            }
 
-            return null;
+            return error;
         }
 
         private async Task Assign(HostAssignmentContext assignmentContext)
@@ -128,44 +203,157 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             _logger.LogInformation($"Applying {assignmentContext.Environment.Count} app setting(s)");
             assignmentContext.ApplyAppSettings(_environment);
 
-            // We need to get the non-PlaceholderMode script path so we can unzip to the correct location.
+            // We need to get the non-PlaceholderMode script Path so we can unzip to the correct location.
             // This asks the factory to skip the PlaceholderMode check when configuring options.
             var options = _optionsFactory.Create(ScriptApplicationHostOptionsSetup.SkipPlaceholder);
+            RunFromPackageContext pkgContext = assignmentContext.GetRunFromPkgContext();
 
-            var zipPath = assignmentContext.ZipUrl;
+            var zipPath = pkgContext.Url;
             if (!string.IsNullOrEmpty(zipPath))
             {
                 // download zip and extract
                 var zipUri = new Uri(zipPath);
-                var filePath = Path.GetTempFileName();
-                await DownloadAsync(zipUri, filePath);
+                string filePath = null;
 
-                _logger.LogInformation($"Extracting files to '{options.ScriptPath}'");
-                ZipFile.ExtractToDirectory(filePath, options.ScriptPath, overwriteFiles: true);
-                _logger.LogInformation($"Zip extraction complete");
+                if (pkgContext.IsScmRunFromPackage())
+                {
+                    bool blobExists = await pkgContext.BlobExistsAsync(_logger);
+                    if (blobExists)
+                    {
+                        filePath = await DownloadAsync(zipUri);
+                    }
+                    else
+                    {
+                        return;
+                    }
+                }
+                else
+                {
+                    filePath = await DownloadAsync(zipUri);
+                }
+
+                UnpackPackage(filePath, options.ScriptPath);
+
+                string bundlePath = Path.Combine(options.ScriptPath, "worker-bundle");
+                if (Directory.Exists(bundlePath))
+                {
+                    _logger.LogInformation($"Python worker bundle detected");
+                }
             }
         }
 
-        private async Task DownloadAsync(Uri zipUri, string filePath)
+        private async Task<string> DownloadAsync(Uri zipUri)
         {
-            var zipPath = $"{zipUri.Authority}{zipUri.AbsolutePath}";
-            _logger.LogInformation($"Downloading zip contents from '{zipPath}' to temp file '{filePath}'");
-
-            var response = await _client.GetAsync(zipUri);
-            if (!response.IsSuccessStatusCode)
+            if (!Utility.TryCleanUrl(zipUri.AbsoluteUri, out string cleanedUrl))
             {
-                string error = $"Error downloading zip content {zipPath}";
-                _logger.LogError(error);
-                throw new InvalidDataException(error);
+                throw new Exception("Invalid url for the package");
             }
 
-            using (var content = await response.Content.ReadAsStreamAsync())
-            using (var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+            var filePath = Path.Combine(Path.GetTempPath(), Path.GetFileName(zipUri.AbsolutePath));
+            _logger.LogInformation($"Downloading zip contents from '{cleanedUrl}' to temp file '{filePath}'");
+
+            HttpResponseMessage response = null;
+
+            await Utility.InvokeWithRetriesAsync(async () =>
             {
-                await content.CopyToAsync(stream);
+                try
+                {
+                    using (_metricsLogger.LatencyEvent(MetricEventNames.LinuxContainerSpecializationZipDownload))
+                    {
+                        var request = new HttpRequestMessage(HttpMethod.Get, zipUri);
+                        response = await _client.SendAsync(request);
+                        response.EnsureSuccessStatusCode();
+                    }
+                }
+                catch (Exception e)
+                {
+                    string error = $"Error downloading zip content {cleanedUrl}";
+                    _logger.LogError(e, error);
+                    throw;
+                }
+
+                _logger.LogInformation($"{response.Content.Headers.ContentLength} bytes downloaded");
+            }, 2, TimeSpan.FromSeconds(0.5));
+
+            using (_metricsLogger.LatencyEvent(MetricEventNames.LinuxContainerSpecializationZipWrite))
+            {
+                using (var content = await response.Content.ReadAsStreamAsync())
+                using (var stream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 4096, useAsync: true))
+                {
+                    await content.CopyToAsync(stream);
+                }
+
+                _logger.LogInformation($"{response.Content.Headers.ContentLength} bytes written");
             }
 
-            _logger.LogInformation($"{response.Content.Headers.ContentLength} bytes downloaded");
+            return filePath;
+        }
+
+        private void UnpackPackage(string filePath, string scriptPath)
+        {
+            if (_environment.IsMountEnabled() &&
+                // Only attempt to use FUSE on Linux
+                RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                using (_metricsLogger.LatencyEvent(MetricEventNames.LinuxContainerSpecializationFuseMount))
+                {
+                    if (FileIsAny(".squashfs", ".sfs", ".sqsh", ".img", ".fs"))
+                    {
+                        MountFsImage(filePath, scriptPath);
+                    }
+                    else if (FileIsAny(".zip"))
+                    {
+                        MountZipFile(filePath, scriptPath);
+                    }
+                    else
+                    {
+                        throw new InvalidOperationException($"Can't find Filesystem to match {filePath}");
+                    }
+                }
+            }
+            else
+            {
+                using (_metricsLogger.LatencyEvent(MetricEventNames.LinuxContainerSpecializationZipExtract))
+                {
+                    _logger.LogInformation($"Extracting files to '{scriptPath}'");
+                    ZipFile.ExtractToDirectory(filePath, scriptPath, overwriteFiles: true);
+                    _logger.LogInformation($"Zip extraction complete");
+                }
+            }
+
+            bool FileIsAny(params string[] options)
+                => options.Any(o => filePath.EndsWith(o, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private void MountFsImage(string filePath, string scriptPath)
+            => RunFuseMount($"squashfuse_ll -o nonempty '{filePath}' '{scriptPath}'", scriptPath);
+
+        private void MountZipFile(string filePath, string scriptPath)
+            => RunFuseMount($"fuse-zip -o nonempty -r '{filePath}' '{scriptPath}'", scriptPath);
+
+        private void RunFuseMount(string mountCommand, string targetPath)
+        {
+            var bashCommand = $"(mknod /dev/fuse c 10 229 || true) && (mkdir -p '{targetPath}' || true) && ({mountCommand})";
+            var process = new Process
+            {
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "bash",
+                    Arguments = $"-c \"{bashCommand}\"",
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                }
+            };
+            _logger.LogInformation($"Running: {process.StartInfo.FileName} {process.StartInfo.Arguments}");
+            process.Start();
+            var output = process.StandardOutput.ReadToEnd();
+            var error = process.StandardError.ReadToEnd();
+            process.WaitForExit();
+            _logger.LogInformation($"Output: {output}");
+            _logger.LogInformation($"error: {output}");
+            _logger.LogInformation($"exitCode: {process.ExitCode}");
         }
 
         public IDictionary<string, string> GetInstanceInfo()

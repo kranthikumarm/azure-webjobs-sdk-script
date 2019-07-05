@@ -14,6 +14,7 @@ using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Rpc;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.WebHost.Models;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.Extensions.DependencyInjection;
@@ -102,7 +103,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             IList<string> logs = null;
             await TestHelpers.Await(() =>
             {
-                logs = Fixture.Host.GetLogMessages().Select(p => p.FormattedMessage).Where(p => p != null).ToArray();
+                logs = Fixture.Host.GetScriptHostLogMessages().Select(p => p.FormattedMessage).Where(p => p != null).ToArray();
                 return logs.Any(p => p.Contains(guid2));
             });
 
@@ -115,7 +116,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             // Assert.Equal(2, Fixture.MetricsLogger.LoggedEvents.Where(p => p == key).Count());
 
             // Make sure we've gotten a log from the aggregator
-            IEnumerable<LogMessage> getAggregatorLogs() => Fixture.Host.GetLogMessages().Where(p => p.Category == LogCategories.Aggregator);
+            IEnumerable<LogMessage> getAggregatorLogs() => Fixture.Host.GetScriptHostLogMessages().Where(p => p.Category == LogCategories.Aggregator);
 
             await TestHelpers.Await(() => getAggregatorLogs().Any());
 
@@ -148,6 +149,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             var url = await response.Content.ReadAsStringAsync();
             Assert.Equal($"{actualProtocol}://{actualHost}/{path}", url);
+        }
+
+        [Fact]
+        public async Task VerifyResultRedirect()
+        {
+            const string path = "api/httptrigger-redirect";
+            var request = new HttpRequestMessage
+            {
+                RequestUri = new Uri(string.Format($"http://localhost/{path}")),
+                Method = HttpMethod.Get
+            };
+
+            var response = await Fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(response.StatusCode, HttpStatusCode.Redirect);
         }
 
         [Fact]
@@ -189,6 +204,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             HttpResponseMessage response = await Fixture.Host.HttpClient.GetAsync($"api/LoadScriptReference");
             Assert.Equal(HttpStatusCode.OK, response.StatusCode);
             Assert.Equal("TestClass", await response.Content.ReadAsStringAsync());
+        }
+
+        [Fact]
+        public async Task MissingAssemblies_ShowsHelpfulMessage()
+        {
+            HttpResponseMessage response = await Fixture.Host.HttpClient.GetAsync($"api/MissingAssemblies");
+            var logs = Fixture.Host.GetScriptHostLogMessages().Select(p => p.FormattedMessage).Where(p => p != null).ToArray();
+            var hasWarning = logs.Any(p => p.Contains("project.json' should not be used to reference NuGet packages. Try creating a 'function.proj' file instead. Learn more: https://go.microsoft.com/fwlink/?linkid=2091419"));
+            Assert.Equal(HttpStatusCode.InternalServerError, response.StatusCode);
+            Assert.Equal(true, hasWarning);
         }
 
         [Fact]
@@ -288,6 +313,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             var outBlob = Fixture.TestOutputContainer.GetBlockBlobReference(blobName);
             string result = await TestHelpers.WaitForBlobAndGetStringAsync(outBlob);
             Assert.Equal(expectedValue, Utility.RemoveUtf8ByteOrderMark(result));
+        }
+
+        [Fact]
+        public async Task FunctionWithIndexingError_ReturnsError()
+        {
+            FunctionStatus status = await Fixture.Host.GetFunctionStatusAsync("FunctionIndexingError");
+            string error = status.Errors.Single();
+            Assert.Equal("Microsoft.Azure.WebJobs.Host: Error indexing method 'Functions.FunctionIndexingError'. Microsoft.Azure.WebJobs.Extensions.Storage: Storage account connection string 'setting_does_not_exist' does not exist. Make sure that it is a defined App Setting.", error);
         }
 
         //[Theory(Skip = "Not yet enabled.")]
@@ -406,13 +439,16 @@ namespace SecondaryDependency
                         "AssembliesFromSharedLocation",
                         "HttpTrigger-Dynamic",
                         "HttpTrigger-Scenarios",
+                        "HttpTrigger-Redirect",
                         "HttpTriggerToBlob",
                         "FunctionExecutionContext",
                         "LoadScriptReference",
                         "ManualTrigger",
                         "MultipleOutputs",
                         "QueueTriggerToBlob",
-                        "Scenarios"
+                        "Scenarios",
+                        "FunctionIndexingError",
+                        "MissingAssemblies"
                     };
                 });
 

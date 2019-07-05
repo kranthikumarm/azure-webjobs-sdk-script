@@ -27,5 +27,23 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
         public const string FunctionCompileLatencyByLanguageFormat = "function.compile.{0}.latency";
         public const string FunctionInvokeThrottled = "function.invoke.throttled";
         public const string FunctionUserLog = "function.userlog";
+        public const string FunctionInvokeSucceeded = "function.invoke.succeeded";
+        public const string FunctionInvokeFailed = "function.invoke.failed";
+
+        // secret managment events
+        public const string SecretManagerDeleteSecret = "secretmanager.deletesecret.{0}";
+        public const string SecretManagerGetFunctionSecrets = "secretmanager.getfunctionsecrets.{0}";
+        public const string SecretManagerGetHostSecrets = "secretmanager.gethostsecrets.{0}";
+        public const string SecretManagerAddOrUpdateFunctionSecret = "secretmanager.addorupdatefunctionsecret.{0}";
+        public const string SecretManagerSetMasterKey = "secretmanager.setmasterkey.{0}";
+        public const string SecretManagerPurgeOldSecrets = "secretmanager.purgeoldsecrets.{0}";
+
+        // Linux container specialization events
+        public const string LinuxContainerSpecializationZipExtract = "linux.container.specialization.zip.extract";
+        public const string LinuxContainerSpecializationZipDownload = "linux.container.specialization.zip.download";
+        public const string LinuxContainerSpecializationZipWrite = "linux.container.specialization.zip.write";
+        public const string LinuxContainerSpecializationZipHead = "linux.container.specialization.zip.head";
+        public const string LinuxContainerSpecializationFuseMount = "linux.container.specialization.zip.mount";
+        public const string LinuxContainerSpecializationMSIInit = "linux.container.specialization.msi.init";
     }
 }

@@ -68,5 +68,113 @@ namespace Microsoft.Azure.WebJobs.Script.Properties {
                 return ResourceManager.GetString("DotNetFunctionEntryPointRulesMessage", resourceCulture);
             }
         }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot delete an extension. Persistent file system not available in the current hosting environment.
+        /// </summary>
+        internal static string ErrorDeletingExtension {
+            get {
+                return ResourceManager.GetString("ErrorDeletingExtension", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot install an extension. Persistent file system not available in the current hosting environment.
+        /// </summary>
+        internal static string ErrorInstallingExtension {
+            get {
+                return ResourceManager.GetString("ErrorInstallingExtension", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot delete extension when ExtensionBundles is configured..
+        /// </summary>
+        internal static string ExtensionBundleBadRequestDelete {
+            get {
+                return ResourceManager.GetString("ExtensionBundleBadRequestDelete", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Cannot install extension when ExtensionBundles is configured..
+        /// </summary>
+        internal static string ExtensionBundleBadRequestInstall {
+            get {
+                return ResourceManager.GetString("ExtensionBundleBadRequestInstall", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Binding metadata not found within the extension bundle or extension bundle is not configured for the function app..
+        /// </summary>
+        internal static string ExtensionBundleBindingMetadataNotFound {
+            get {
+                return ResourceManager.GetString("ExtensionBundleBindingMetadataNotFound", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The value of id property in extensionBundle section of {0} file is invalid or missing. See https://aka.ms/functions-hostjson for more information.
+        /// </summary>
+        internal static string ExtensionBundleConfigMissingId {
+            get {
+                return ResourceManager.GetString("ExtensionBundleConfigMissingId", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The id and version property are missing in extensionBundle section of {0} file. See https://aka.ms/functions-hostjson for more information&quot;.
+        /// </summary>
+        internal static string ExtensionBundleConfigMissingMessage {
+            get {
+                return ResourceManager.GetString("ExtensionBundleConfigMissingMessage", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to The value of version property in extensionBundle section of {0} file is invalid or missing. See https://aka.ms/functions-hostjson for more information.
+        /// </summary>
+        internal static string ExtensionBundleConfigMissingVersion {
+            get {
+                return ResourceManager.GetString("ExtensionBundleConfigMissingVersion", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Resources.{0} not found within the extension bundle or extension bundle is not configured for the function app..
+        /// </summary>
+        internal static string ExtensionBundleResourcesLocaleNotFound {
+            get {
+                return ResourceManager.GetString("ExtensionBundleResourcesLocaleNotFound", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Resources metadata not found within the extension bundle or extension bundle is not configured for the function app..
+        /// </summary>
+        internal static string ExtensionBundleResourcesNotFound {
+            get {
+                return ResourceManager.GetString("ExtensionBundleResourcesNotFound", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Templates not found within the extension bundle or extension bundle is not configured for the function app..
+        /// </summary>
+        internal static string ExtensionBundleTemplatesNotFound {
+            get {
+                return ResourceManager.GetString("ExtensionBundleTemplatesNotFound", resourceCulture);
+            }
+        }
+        
+        /// <summary>
+        ///   Looks up a localized string similar to Bundle version matching the {0} was not found.
+        /// </summary>
+        internal static string MatchingBundleNotFound {
+            get {
+                return ResourceManager.GetString("MatchingBundleNotFound", resourceCulture);
+            }
+        }
     }
 }

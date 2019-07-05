@@ -23,6 +23,7 @@ using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.Extensibility;
 using Microsoft.Azure.WebJobs.Script.Rpc;
@@ -68,7 +69,6 @@ namespace Microsoft.Azure.WebJobs.Script
 
         private IList<IDisposable> _eventSubscriptions = new List<IDisposable>();
         private IFunctionDispatcher _functionDispatcher;
-        private IProcessRegistry _processRegistry = new EmptyProcessRegistry();
 
         // Specify the "builtin binding types". These are types that are directly accesible without needing an explicit load gesture.
         // This is the set of bindings we shipped prior to binding extensibility.
@@ -80,6 +80,7 @@ namespace Microsoft.Azure.WebJobs.Script
             IJobHostContextFactory jobHostContextFactory,
             IConfiguration configuration,
             IDistributedLockManager distributedLockManager,
+            IScriptHostManager scriptHostManager,
             IScriptEventManager eventManager,
             ILoggerFactory loggerFactory,
             IFunctionDispatcher functionDispatcher,
@@ -131,7 +132,7 @@ namespace Microsoft.Azure.WebJobs.Script
             _primaryHostStateProvider = primaryHostStateProvider;
             _bindingProviders = new List<IScriptBindingProvider>(bindingProviders);
             _metadataProvider = metadataProvider;
-            _eventSubscriptions.Add(EventManager.OfType<WorkerProcessErrorEvent>()
+            _eventSubscriptions.Add(EventManager.OfType<FunctionIndexingEvent>()
                 .Subscribe(evt =>
                 {
                     HandleHostError(evt.Exception);
@@ -229,26 +230,15 @@ namespace Microsoft.Azure.WebJobs.Script
             await base.CallAsync(method, arguments, cancellationToken);
         }
 
-        internal static void AddLanguageWorkerChannelErrors(IFunctionDispatcher functionDispatcher, IDictionary<string, ICollection<string>> functionErrors)
-        {
-            foreach (KeyValuePair<string, LanguageWorkerState> kvp in functionDispatcher.LanguageWorkerChannelStates)
-            {
-                string language = kvp.Key;
-                LanguageWorkerState workerState = kvp.Value;
-                foreach (var functionRegistrationContext in workerState.GetRegistrations())
-                {
-                    var exMessage = $"Failed to start language worker process for: {language}";
-                    var languageWorkerChannelException = workerState.Errors != null && workerState.Errors.Count > 0 ? new LanguageWorkerChannelException(exMessage, workerState.Errors[workerState.Errors.Count - 1]) : new LanguageWorkerChannelException(exMessage);
-                    Utility.AddFunctionError(functionErrors, functionRegistrationContext.Metadata.Name, Utility.FlattenException(languageWorkerChannelException, includeSource: false));
-                }
-            }
-        }
-
         protected override async Task StartAsyncCore(CancellationToken cancellationToken)
         {
             var ignore = LogInitializationAsync();
 
             await InitializeAsync();
+
+            // Throw if cancellation occurred during initialization.
+            cancellationToken.ThrowIfCancellationRequested();
+
             await base.StartAsyncCore(cancellationToken);
 
             LogHostFunctionErrors();
@@ -261,11 +251,6 @@ namespace Microsoft.Azure.WebJobs.Script
         public async Task InitializeAsync()
         {
             _stopwatch.Start();
-            if (!_environment.IsPlaceholderModeEnabled())
-            {
-                string runtimeLanguage = string.IsNullOrEmpty(_workerRuntime) ? "none" : _workerRuntime;
-                _metricsLogger.LogEvent(string.Format(MetricEventNames.HostStartupRuntimeLanguage, runtimeLanguage));
-            }
             using (_metricsLogger.LatencyEvent(MetricEventNames.HostStartupLatency))
             {
                 PreInitialize();
@@ -274,8 +259,15 @@ namespace Microsoft.Azure.WebJobs.Script
                 // Generate Functions
                 IEnumerable<FunctionMetadata> functions = GetFunctionsMetadata();
 
+                _workerRuntime = _workerRuntime ?? Utility.GetWorkerRuntime(functions);
+
+                if (!_environment.IsPlaceholderModeEnabled())
+                {
+                    _metricsLogger.LogEvent(string.Format(MetricEventNames.HostStartupRuntimeLanguage, _workerRuntime));
+                }
+
                 // Initialize language worker function dispatcher
-                _functionDispatcher.Initialize(_workerRuntime, functions);
+                await _functionDispatcher.InitializeAsync(functions);
 
                 var directTypes = GetDirectTypes(functions);
                 await InitializeFunctionDescriptorsAsync(functions);
@@ -290,13 +282,12 @@ namespace Microsoft.Azure.WebJobs.Script
             // If the host id is explicitly set, emit a warning that this could cause issues and shouldn't be done
             if (_configuration[ConfigurationSectionNames.HostIdPath] != null)
             {
-                _logger.LogWarning("Host id explicitly set in configuration. This is not a recommended configuration and may lead to unexpected behavior.");
+                _logger.HostIdIsSet();
             }
 
             string extensionVersion = _environment.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsExtensionVersion);
             string hostId = await _hostIdProvider.GetHostIdAsync(CancellationToken.None);
-            string message = $"Starting Host (HostId={hostId}, InstanceId={InstanceId}, Version={Version}, ProcessId={Process.GetCurrentProcess().Id}, AppDomainId={AppDomain.CurrentDomain.Id}, InDebugMode={InDebugMode}, InDiagnosticMode={InDiagnosticMode}, FunctionsExtensionVersion={extensionVersion})";
-            _logger.LogInformation(message);
+            _logger.StartingHost(hostId, InstanceId, Version, InDebugMode, InDiagnosticMode, extensionVersion);
         }
 
         private void LogHostFunctionErrors()
@@ -311,7 +302,7 @@ namespace Microsoft.Azure.WebJobs.Script
                     builder.AppendLine(string.Format(CultureInfo.InvariantCulture, "{0}: {1}", error.Key, functionErrors));
                 }
                 string message = builder.ToString();
-                _logger.LogError(message);
+                _logger.FunctionsErrors(message);
             }
         }
 
@@ -417,9 +408,7 @@ namespace Microsoft.Azure.WebJobs.Script
                 }
                 else if (string.Equals(extensionVersion, "latest", StringComparison.OrdinalIgnoreCase))
                 {
-                    _logger.LogWarning($"Site extension version currently set to '{extensionVersion}'. " +
-                        $"It is recommended that you target a major version (e.g. ~2) to avoid unintended upgrades. " +
-                        $"You can change that value by updating the '{EnvironmentSettingNames.FunctionsExtensionVersion}' App Setting.");
+                    _logger.VersionRecommendation(extensionVersion);
                 }
             }
 
@@ -477,31 +466,22 @@ namespace Microsoft.Azure.WebJobs.Script
         /// </summary>
         internal async Task InitializeFunctionDescriptorsAsync(IEnumerable<FunctionMetadata> functionMetadata)
         {
-            if (string.IsNullOrEmpty(_workerRuntime))
+            _logger.AddingDescriptorProviderForLanguage(_workerRuntime);
+            if (string.Equals(_workerRuntime, LanguageWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase))
             {
-                _logger.LogDebug("Adding Function descriptor providers for all languages.");
                 _descriptorProviders.Add(new DotNetFunctionDescriptorProvider(this, ScriptOptions, _bindingProviders, _metricsLogger, _loggerFactory));
-                _descriptorProviders.Add(new WorkerFunctionDescriptorProvider(this, _workerRuntime, ScriptOptions, _bindingProviders, _functionDispatcher, _loggerFactory));
             }
             else
             {
-                _logger.LogDebug($"Adding Function descriptor provider for language {_workerRuntime}.");
-                if (string.Equals(_workerRuntime, LanguageWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase))
-                {
-                    _descriptorProviders.Add(new DotNetFunctionDescriptorProvider(this, ScriptOptions, _bindingProviders, _metricsLogger, _loggerFactory));
-                }
-                else
-                {
-                    _descriptorProviders.Add(new WorkerFunctionDescriptorProvider(this, _workerRuntime, ScriptOptions, _bindingProviders, _functionDispatcher, _loggerFactory));
-                }
+                _descriptorProviders.Add(new WorkerFunctionDescriptorProvider(this, _workerRuntime, ScriptOptions, _bindingProviders, _functionDispatcher, _loggerFactory));
             }
 
             Collection<FunctionDescriptor> functions;
             using (_metricsLogger.LatencyEvent(MetricEventNames.HostStartupGetFunctionDescriptorsLatency))
             {
-                _logger.LogDebug("Creating function descriptors.");
+                _logger.CreatingDescriptors();
                 functions = await GetFunctionDescriptorsAsync(functionMetadata, _descriptorProviders);
-                _logger.LogDebug("Function descriptors created.");
+                _logger.DescriptorsCreated();
             }
             Functions = functions;
         }
@@ -555,8 +535,7 @@ namespace Microsoft.Azure.WebJobs.Script
                         try
                         {
                             // destructive operation, thus log
-                            string removeLogMessage = $"Deleting log directory '{logDir.FullName}'";
-                            _logger.LogDebug(removeLogMessage);
+                            _logger.DeletingLogDirectory(logDir.FullName);
                             logDir.Delete(recursive: true);
                         }
                         catch
@@ -569,8 +548,7 @@ namespace Microsoft.Azure.WebJobs.Script
             catch (Exception ex)
             {
                 // Purge is best effort
-                string errorMsg = "An error occurred while purging log files";
-                _logger.LogWarning(0, ex, errorMsg);
+                _logger.ErrorPurgingLogFiles(ex);
             }
         }
 
@@ -612,7 +590,7 @@ namespace Microsoft.Azure.WebJobs.Script
                     // Adding a function error will cause this function to get ignored
                     Utility.AddFunctionError(this.FunctionErrors, metadata.Name, msg);
 
-                    _logger.LogInformation(msg);
+                    _logger.ConfigurationError(msg);
                 }
 
                 return;
@@ -646,8 +624,7 @@ namespace Microsoft.Azure.WebJobs.Script
                 else
                 {
                     // This likely means the function.json and dlls are out of sync. Perhaps a badly generated function.json?
-                    string msg = $"Failed to load type '{typeName}' from '{path}'";
-                    _logger.LogWarning(msg);
+                    _logger.FailedToLoadType(typeName, path);
                 }
             }
             return visitedTypes;
@@ -658,7 +635,10 @@ namespace Microsoft.Azure.WebJobs.Script
             Collection<FunctionDescriptor> functionDescriptors = new Collection<FunctionDescriptor>();
             var httpFunctions = new Dictionary<string, HttpTriggerAttribute>();
 
-            Utility.VerifyFunctionsMatchSpecifiedLanguage(functions, _workerRuntime);
+            if (!_environment.IsPlaceholderModeEnabled())
+            {
+                Utility.VerifyFunctionsMatchSpecifiedLanguage(functions, _workerRuntime);
+            }
 
             foreach (FunctionMetadata metadata in functions)
             {
@@ -789,10 +769,6 @@ namespace Microsoft.Azure.WebJobs.Script
                 // log file
                 NotifyInvoker(functionException.MethodName, functionException);
             }
-            else if (exception is LanguageWorkerChannelException)
-            {
-                AddLanguageWorkerChannelErrors(_functionDispatcher, FunctionErrors);
-            }
             else
             {
                 // See if we can identify which function caused the error, and if we can
@@ -867,8 +843,7 @@ namespace Microsoft.Azure.WebJobs.Script
         {
             ApplyJobHostMetadata();
 
-            string message = $"Host initialized ({_stopwatch.ElapsedMilliseconds}ms)";
-            _logger.LogInformation(message);
+            _logger.ScriptHostInitialized(_stopwatch.ElapsedMilliseconds);
 
             HostInitialized?.Invoke(this, EventArgs.Empty);
 
@@ -881,8 +856,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
             base.OnHostStarted();
 
-            string message = $"Host started ({_stopwatch.ElapsedMilliseconds}ms)";
-            _logger.LogInformation(message);
+            _logger.ScriptHostStarted(_stopwatch.ElapsedMilliseconds);
         }
 
         protected override void Dispose(bool disposing)
@@ -895,7 +869,6 @@ namespace Microsoft.Azure.WebJobs.Script
                 }
 
                 _functionDispatcher?.Dispose();
-                (_processRegistry as IDisposable)?.Dispose();
 
                 foreach (var function in Functions)
                 {

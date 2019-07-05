@@ -24,12 +24,20 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AppInsightsQuickPulseAuthApiKey = "APPINSIGHTS_QUICKPULSEAUTHAPIKEY";
         public const string FunctionsExtensionVersion = "FUNCTIONS_EXTENSION_VERSION";
         public const string ContainerName = "CONTAINER_NAME";
+        public const string WebSiteHomeStampName = "WEBSITE_HOME_STAMPNAME";
+        public const string WebSiteStampDeploymentId = "WEBSITE_STAMP_DEPLOYMENT_ID";
         public const string WebSiteAuthEncryptionKey = "WEBSITE_AUTH_ENCRYPTION_KEY";
         public const string ContainerEncryptionKey = "CONTAINER_ENCRYPTION_KEY";
         public const string ConsoleLoggingDisabled = "CONSOLE_LOGGING_DISABLED";
         public const string SkipSslValidation = "SCM_SKIP_SSL_VALIDATION";
         public const string EnvironmentNameKey = "AZURE_FUNCTIONS_ENVIRONMENT";
         public const string EasyAuthEnabled = "WEBSITE_AUTH_ENABLED";
+        public const string AzureWebJobsSecretStorageKeyVaultName = "AzureWebJobsSecretStorageKeyVaultName";
+        public const string AzureWebJobsSecretStorageKeyVaultConnectionString = "AzureWebJobsSecretStorageKeyVaultConnectionString";
+        public const string AzureWebsiteArmCacheEnabled = "WEBSITE_FUNCTIONS_ARMCACHE_ENABLED";
+        public const string MountEnabled = "WEBSITE_MOUNT_ENABLED";
+        public const string MsiEndpoint = "MSI_ENDPOINT";
+        public const string MsiSecret = "MSI_SECRET";
 
         /// <summary>
         /// Environment variable dynamically set by the platform when it is safe to
@@ -47,5 +55,18 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureWebsiteAltZipDeployment = "WEBSITE_RUN_FROM_ZIP";
         public const string AzureWebsiteRunFromPackage = "WEBSITE_RUN_FROM_PACKAGE";
         public const string RegionName = "REGION_NAME";
+
+        // handling server side builds
+        public const string ScmRunFromPackage = "SCM_RUN_FROM_PACKAGE";
+
+        public const string LinuxAzureAppServiceStorage = "WEBSITES_ENABLE_APP_SERVICE_STORAGE";
+        public const string CoreToolsEnvironment = "FUNCTIONS_CORETOOLS_ENVIRONMENT";
+        public const string RunningInContainer = "DOTNET_RUNNING_IN_CONTAINER";
+
+        public const string ExtensionBundleSourceUri = "FUNCTIONS_EXTENSIONBUNDLE_SOURCE_URI";
+        public const string AzureWebJobsKubernetesSecretName = "AzureWebJobsKubernetesSecretName";
+
+        public const string KubernetesServiceHost = "KUBERNETES_SERVICE_HOST";
+        public const string KubernetesServiceHttpsPort = "KUBERNETES_SERVICE_PORT_HTTPS";
     }
 }

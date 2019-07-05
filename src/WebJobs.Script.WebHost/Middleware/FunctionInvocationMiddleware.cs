@@ -9,9 +9,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Authorization.Policy;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Logging;
@@ -27,6 +29,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
     public class FunctionInvocationMiddleware
     {
         private readonly RequestDelegate _next;
+        private IApplicationLifetime _applicationLifetime;
 
         public FunctionInvocationMiddleware(RequestDelegate next)
         {
@@ -49,6 +52,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
                 await _next(context);
             }
 
+            _applicationLifetime = context.RequestServices.GetService<IApplicationLifetime>();
+
             IFunctionExecutionFeature functionExecution = context.Features.Get<IFunctionExecutionFeature>();
             if (functionExecution != null && !context.Response.HasStarted())
             {
@@ -62,11 +67,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
                     return;
                 }
 
-                var actionContext = new ActionContext
-                {
-                    HttpContext = context
-                };
-
+                ActionContext actionContext = new ActionContext(context, new RouteData(), new ActionDescriptor());
                 await result.ExecuteResultAsync(actionContext);
             }
         }
@@ -142,8 +143,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Middleware
 
                 using (logger.BeginScope(scopeState))
                 {
-                    // TODO: Flow cancellation token from caller
-                    await functionExecution.ExecuteAsync(context.Request, CancellationToken.None);
+                    CancellationToken cancellationToken = _applicationLifetime != null ? _applicationLifetime.ApplicationStopping : CancellationToken.None;
+                    await functionExecution.ExecuteAsync(context.Request, cancellationToken);
                 }
             }
 

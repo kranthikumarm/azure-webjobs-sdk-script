@@ -9,7 +9,9 @@ using System.Text;
 using Google.Protobuf;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.WebJobs.Extensions.Http;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
+using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using RpcDataType = Microsoft.Azure.WebJobs.Script.Grpc.Messages.TypedData.DataOneofCase;
@@ -45,7 +47,7 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
             }
         }
 
-        public static TypedData ToRpc(this object value)
+        public static TypedData ToRpc(this object value, ILogger logger, Capabilities capabilities)
         {
             TypedData typedData = new TypedData();
 
@@ -101,11 +103,46 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                     }
                 }
 
+                // parse ClaimsPrincipal if exists
+                if (request.HttpContext?.User?.Identities != null)
+                {
+                    logger.LogDebug("HttpContext has ClaimsPrincipal; parsing to gRPC.");
+                    foreach (var id in request.HttpContext.User.Identities)
+                    {
+                        var rpcClaimsIdentity = new RpcClaimsIdentity();
+                        if (id.AuthenticationType != null)
+                        {
+                            rpcClaimsIdentity.AuthenticationType = new NullableString { Value = id.AuthenticationType };
+                        }
+
+                        if (id.NameClaimType != null)
+                        {
+                            rpcClaimsIdentity.NameClaimType = new NullableString { Value = id.NameClaimType };
+                        }
+
+                        if (id.RoleClaimType != null)
+                        {
+                            rpcClaimsIdentity.RoleClaimType = new NullableString { Value = id.RoleClaimType };
+                        }
+
+                        foreach (var claim in id.Claims)
+                        {
+                            if (claim.Type != null && claim.Value != null)
+                            {
+                                rpcClaimsIdentity.Claims.Add(new RpcClaim { Value = claim.Value, Type = claim.Type });
+                            }
+                        }
+
+                        http.Identities.Add(rpcClaimsIdentity);
+                    }
+                }
+
                 // parse request body as content-type
                 if (request.Body != null && request.ContentLength > 0)
                 {
                     object body = null;
-                    string rawBody = null;
+                    string rawBodyString = null;
+                    byte[] bytes = RequestBodyToBytes(request);
 
                     MediaTypeHeaderValue mediaType = null;
                     if (MediaTypeHeaderValue.TryParse(request.ContentType, out mediaType))
@@ -113,36 +150,43 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                         if (string.Equals(mediaType.MediaType, "application/json", StringComparison.OrdinalIgnoreCase))
                         {
                             var jsonReader = new StreamReader(request.Body, Encoding.UTF8);
-                            rawBody = jsonReader.ReadToEnd();
+                            rawBodyString = jsonReader.ReadToEnd();
                             try
                             {
-                                body = JsonConvert.DeserializeObject(rawBody);
+                                body = JsonConvert.DeserializeObject(rawBodyString);
                             }
                             catch (JsonException)
                             {
-                                body = rawBody;
+                                body = rawBodyString;
                             }
                         }
                         else if (string.Equals(mediaType.MediaType, "application/octet-stream", StringComparison.OrdinalIgnoreCase) ||
                             mediaType.MediaType.IndexOf("multipart/", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            var length = Convert.ToInt32(request.ContentLength);
-                            var bytes = new byte[length];
-                            request.Body.Read(bytes, 0, length);
                             body = bytes;
-                            rawBody = Encoding.UTF8.GetString(bytes);
+                            if (!IsRawBodyBytesRequested(capabilities))
+                            {
+                                rawBodyString = Encoding.UTF8.GetString(bytes);
+                            }
                         }
                     }
                     // default if content-tye not found or recognized
-                    if (body == null && rawBody == null)
+                    if (body == null && rawBodyString == null)
                     {
                         var reader = new StreamReader(request.Body, Encoding.UTF8);
-                        body = rawBody = reader.ReadToEnd();
+                        body = rawBodyString = reader.ReadToEnd();
                     }
 
                     request.Body.Position = 0;
-                    http.Body = body.ToRpc();
-                    http.RawBody = rawBody.ToRpc();
+                    http.Body = body.ToRpc(logger, capabilities);
+                    if (IsRawBodyBytesRequested(capabilities))
+                    {
+                        http.RawBody = bytes.ToRpc(logger, capabilities);
+                    }
+                    else
+                    {
+                        http.RawBody = rawBodyString.ToRpc(logger, capabilities);
+                    }
                 }
             }
             else
@@ -158,6 +202,36 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                 }
             }
             return typedData;
+        }
+
+        private static bool IsRawBodyBytesRequested(Capabilities capabilities)
+        {
+            return capabilities.GetCapabilityState(LanguageWorkerConstants.RawHttpBodyBytes) != null;
+        }
+
+        internal static byte[] RequestBodyToBytes(HttpRequest request)
+        {
+            var length = Convert.ToInt32(request.ContentLength);
+            var bytes = new byte[length];
+            request.Body.Read(bytes, 0, length);
+            request.Body.Position = 0;
+            return bytes;
+        }
+
+        public static BindingInfo ToBindingInfo(this BindingMetadata bindingMetadata)
+        {
+            BindingInfo bindingInfo = new BindingInfo
+            {
+                Direction = (BindingInfo.Types.Direction)bindingMetadata.Direction,
+                Type = bindingMetadata.Type
+            };
+
+            if (bindingMetadata.DataType != null)
+            {
+                bindingInfo.DataType = (BindingInfo.Types.DataType)bindingMetadata.DataType;
+            }
+
+            return bindingInfo;
         }
     }
 }

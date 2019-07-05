@@ -2,12 +2,8 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Collections;
 using System.Collections.Generic;
-using System.Globalization;
 using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Newtonsoft.Json;
 
@@ -17,7 +13,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
     {
         protected ScriptSecrets()
         {
-            HostName = ScriptSettingsManager.Instance.GetSetting(EnvironmentSettingNames.AzureWebsiteHostName);
             InstanceId = ScriptSettingsManager.Instance.AzureWebsiteInstanceId;
             Source = ScriptConstants.Runtime;
         }
@@ -36,6 +31,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         [JsonProperty(PropertyName = "source")]
         public string Source { get; set; }
+
+        [JsonProperty(PropertyName = "decryptionKeyId")]
+        public string DecryptionKeyId { get; set; }
 
         protected abstract ICollection<Key> GetKeys(string keyScope);
 

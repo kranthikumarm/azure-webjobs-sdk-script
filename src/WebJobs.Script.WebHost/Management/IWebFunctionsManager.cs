@@ -10,14 +10,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
 {
     public interface IWebFunctionsManager
     {
-        Task<IEnumerable<FunctionMetadataResponse>> GetFunctionsMetadata(HttpRequest request, bool includeProxies);
+        Task<IEnumerable<FunctionMetadataResponse>> GetFunctionsMetadata(bool includeProxies);
 
         Task<(bool, FunctionMetadataResponse)> TryGetFunction(string name, HttpRequest request);
 
         Task<(bool, bool, FunctionMetadataResponse)> CreateOrUpdate(string name, FunctionMetadataResponse functionMetadata, HttpRequest request);
 
         (bool, string) TryDeleteFunction(FunctionMetadataResponse function);
-
-        Task<(bool success, string error)> TrySyncTriggers();
     }
 }

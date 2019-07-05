@@ -49,9 +49,9 @@ else
 	NUGET_PATH=$NUGET_ROOT/packages
 fi
 
-GRPC_TOOLS_PATH=$NUGET_PATH/grpc.tools/1.16.0/tools/$PLATFORM
+GRPC_TOOLS_PATH=$NUGET_PATH/grpc.tools/1.20.1/tools/$PLATFORM
 PROTO_PATH=./azure-functions-language-worker-protobuf/src/proto
-PROTOBUF_TOOLS=$NUGET_PATH/google.protobuf.tools/3.6.1/tools
+PROTOBUF_TOOLS=$NUGET_PATH/google.protobuf.tools/3.7.0/tools
 PROTO=./azure-functions-language-worker-protobuf/src/proto/FunctionRpc.proto
 MSGDIR=./Messages
 
@@ -65,6 +65,17 @@ mkdir $MSGDIR
 
 OUTDIR=$MSGDIR/DotNet
 mkdir $OUTDIR
+
+#generate shared types
+for f in $PROTO_PATH/shared/*.proto; do
+	$GRPC_TOOLS_PATH/protoc $f --csharp_out $OUTDIR --grpc_out=$OUTDIR --plugin=protoc-gen-grpc=$GRPC_TOOLS_PATH/grpc_csharp_plugin --proto_path=$PROTO_PATH --proto_path=$PROTOBUF_TOOLS
+done
+
+#generate other types
+for f in $PROTO_PATH/*/*.proto; do
+	$GRPC_TOOLS_PATH/protoc $f --csharp_out $OUTDIR --grpc_out=$OUTDIR --plugin=protoc-gen-grpc=$GRPC_TOOLS_PATH/grpc_csharp_plugin --proto_path=$PROTO_PATH --proto_path=$PROTOBUF_TOOLS
+done
+
 $GRPC_TOOLS_PATH/protoc $PROTO --csharp_out $OUTDIR --grpc_out=$OUTDIR --plugin=protoc-gen-grpc=$GRPC_TOOLS_PATH/grpc_csharp_plugin --proto_path=$PROTO_PATH --proto_path=$PROTOBUF_TOOLS
 
 # add #pragma warning disable labels

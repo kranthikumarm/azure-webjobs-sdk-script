@@ -94,10 +94,13 @@ namespace Microsoft.Azure.WebJobs.Script
         /// of 2, 4, 8, 16, etc. seconds.</param>
         /// <param name="min">The minimum delay.</param>
         /// <param name="max">The maximum delay.</param>
+        /// <param name="logger">An optional logger that will emit the delay.</param>
         /// <returns>A <see cref="Task"/> representing the computed backoff interval.</returns>
-        public static async Task DelayWithBackoffAsync(int exponent, CancellationToken cancellationToken, TimeSpan? unit = null, TimeSpan? min = null, TimeSpan? max = null)
+        public static async Task DelayWithBackoffAsync(int exponent, CancellationToken cancellationToken, TimeSpan? unit = null,
+            TimeSpan? min = null, TimeSpan? max = null, ILogger logger = null)
         {
             TimeSpan delay = ComputeBackoff(exponent, unit, min, max);
+            logger?.LogDebug($"Delay is '{delay}'.");
 
             if (delay.TotalMilliseconds > 0)
             {
@@ -411,7 +414,7 @@ namespace Microsoft.Azure.WebJobs.Script
             functionName = isFunctionShortName ? functionName : Utility.GetFunctionShortName(functionName);
 
             ICollection<string> functionErrorCollection = new Collection<string>();
-            if (!functionErrors.TryGetValue(functionName, out functionErrorCollection))
+            if (!string.IsNullOrEmpty(functionName) && !functionErrors.TryGetValue(functionName, out functionErrorCollection))
             {
                 functionErrors[functionName] = functionErrorCollection = new Collection<string>();
             }
@@ -515,6 +518,34 @@ namespace Microsoft.Azure.WebJobs.Script
             // check if we should be in an offline state
             string offlineFilePath = Path.Combine(scriptPath, ScriptConstants.AppOfflineFileName);
             if (File.Exists(offlineFilePath))
+            {
+                return true;
+            }
+            return false;
+        }
+
+        public static bool TryCleanUrl(string url, out string cleaned)
+        {
+            cleaned = null;
+
+            Uri uri = null;
+            if (Uri.TryCreate(url, UriKind.Absolute, out uri))
+            {
+                cleaned = $"{uri.Scheme}://{uri.Host}{uri.AbsolutePath}";
+                if (uri.Query.Length > 0)
+                {
+                    cleaned += "...";
+                }
+                return true;
+            }
+
+            return false;
+        }
+
+        public static bool IsHttporManualTrigger(string triggerType)
+        {
+            if (string.Compare("httptrigger", triggerType, StringComparison.OrdinalIgnoreCase) == 0 ||
+                string.Compare("manualtrigger", triggerType, StringComparison.OrdinalIgnoreCase) == 0)
             {
                 return true;
             }

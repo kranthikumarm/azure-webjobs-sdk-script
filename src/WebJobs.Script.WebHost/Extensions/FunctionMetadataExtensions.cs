@@ -5,8 +5,6 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Management.Models;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
@@ -20,16 +18,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Extensions
         /// Maps FunctionMetadata to FunctionMetadataResponse.
         /// </summary>
         /// <param name="functionMetadata">FunctionMetadata to be mapped.</param>
-        /// <param name="request">Current HttpRequest</param>
         /// <param name="hostOptions">The host options</param>
         /// <returns>Promise of a FunctionMetadataResponse</returns>
-        public static async Task<FunctionMetadataResponse> ToFunctionMetadataResponse(this FunctionMetadata functionMetadata, HttpRequest request, ScriptJobHostOptions hostOptions, string routePrefix)
+        public static async Task<FunctionMetadataResponse> ToFunctionMetadataResponse(this FunctionMetadata functionMetadata, ScriptJobHostOptions hostOptions, string routePrefix, string baseUrl)
         {
             var functionPath = Path.Combine(hostOptions.RootScriptPath, functionMetadata.Name);
             var functionMetadataFilePath = Path.Combine(functionPath, ScriptConstants.FunctionMetadataFileName);
-            var baseUrl = request != null
-                ? $"{request.Scheme}://{request.Host}"
-                : "https://localhost/";
+            if (string.IsNullOrEmpty(baseUrl))
+            {
+                baseUrl = "https://localhost/";
+            }
 
             var response = new FunctionMetadataResponse
             {
@@ -72,29 +70,25 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Extensions
         /// <returns>JObject that represent the trigger for scale controller to consume</returns>
         public static async Task<JObject> ToFunctionTrigger(this FunctionMetadata functionMetadata, ScriptJobHostOptions config)
         {
-            // Only look at the function if it's not disabled
-            if (!functionMetadata.IsDisabled)
+            // Get function.json path
+            var functionPath = Path.Combine(config.RootScriptPath, functionMetadata.Name);
+            var functionMetadataFilePath = Path.Combine(functionPath, ScriptConstants.FunctionMetadataFileName);
+
+            // Read function.json as a JObject
+            var functionConfig = await GetFunctionConfig(functionMetadataFilePath);
+
+            // Find the trigger and add functionName to it
+            foreach (JObject binding in (JArray)functionConfig["bindings"])
             {
-                // Get function.json path
-                var functionPath = Path.Combine(config.RootScriptPath, functionMetadata.Name);
-                var functionMetadataFilePath = Path.Combine(functionPath, ScriptConstants.FunctionMetadataFileName);
-
-                // Read function.json as a JObject
-                var functionConfig = await GetFunctionConfig(functionMetadataFilePath);
-
-                // Find the trigger and add functionName to it
-                foreach (JObject binding in (JArray)functionConfig["bindings"])
+                var type = (string)binding["type"];
+                if (type.EndsWith("Trigger", StringComparison.OrdinalIgnoreCase))
                 {
-                    var type = (string)binding["type"];
-                    if (type.EndsWith("Trigger", StringComparison.OrdinalIgnoreCase))
-                    {
-                        binding.Add("functionName", functionMetadata.Name);
-                        return binding;
-                    }
+                    binding.Add("functionName", functionMetadata.Name);
+                    return binding;
                 }
             }
 
-            // If the function is disabled or has no trigger return null
+            // If the function has no trigger return null
             return null;
         }
 
@@ -138,24 +132,34 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Extensions
         private static Uri GetFunctionHref(string functionName, string baseUrl) =>
             new Uri($"{baseUrl}/admin/functions/{functionName}");
 
-        private static Uri GetFunctionInvokeUrlTemplate(string baseUrl, FunctionMetadata functionMetadata, string routePrefix)
+        internal static Uri GetFunctionInvokeUrlTemplate(string baseUrl, FunctionMetadata functionMetadata, string routePrefix)
         {
             var httpBinding = functionMetadata.InputBindings.FirstOrDefault(p => string.Compare(p.Type, "httpTrigger", StringComparison.OrdinalIgnoreCase) == 0);
-            string template = null;
+
             if (httpBinding != null)
             {
+                string customRoute = null;
                 if (httpBinding.Raw != null && httpBinding.Raw.TryGetValue("route", StringComparison.OrdinalIgnoreCase, out JToken value))
                 {
                     // a custom route is specified
-                    template = (string)value;
+                    customRoute = (string)value;
+                }
+
+                string uriString = baseUrl.TrimEnd('/');
+                if (!string.IsNullOrEmpty(routePrefix))
+                {
+                    uriString += $"/{routePrefix.TrimEnd('/')}";
+                }
+
+                if (!string.IsNullOrEmpty(customRoute))
+                {
+                    uriString += $"/{customRoute}";
                 }
                 else
                 {
-                    // form the default function route
-                    template = $"{routePrefix}/{functionMetadata.Name}";
+                    uriString += $"/{functionMetadata.Name}";
                 }
 
-                string uriString = $"{baseUrl}/{template}";
                 return new Uri(uriString.ToLowerInvariant());
             }
 

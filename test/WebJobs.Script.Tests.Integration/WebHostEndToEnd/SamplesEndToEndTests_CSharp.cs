@@ -99,6 +99,37 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
         }
 
         [Fact]
+        public async Task SyncTriggers_InternalAuth_Succeeds()
+        {
+            using (new TestScopedSettings(_settingsManager, EnvironmentSettingNames.AzureWebsiteInstanceId, "testinstance"))
+            {
+                string uri = "admin/host/synctriggers";
+                HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+                HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+            }
+        }
+
+        [Fact]
+        public async Task SyncTriggers_ExternalUnauthorized_ReturnsUnauthorized()
+        {
+            string uri = "admin/host/synctriggers";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.Unauthorized, response.StatusCode);
+        }
+
+        [Fact]
+        public async Task SyncTriggers_AdminLevel_Succeeds()
+        {
+            string uri = "admin/host/synctriggers";
+            HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Post, uri);
+            request.Headers.Add(AuthenticationLevelHandler.FunctionsKeyHeaderName, await _fixture.Host.GetMasterKeyAsync());
+            HttpResponseMessage response = await _fixture.Host.HttpClient.SendAsync(request);
+            Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        }
+
+        [Fact]
         public async Task HostLog_Anonymous_Fails()
         {
             var request = new HttpRequestMessage(HttpMethod.Post, "admin/host/log");
@@ -160,7 +191,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             await Task.Delay(1000);
 
-            var hostLogs = _fixture.Host.GetLogMessages();
+            var hostLogs = _fixture.Host.GetScriptHostLogMessages();
             foreach (var expectedLog in logs.Select(p => p.Message))
             {
                 Assert.Equal(1, hostLogs.Count(p => p.FormattedMessage != null && p.FormattedMessage.Contains(expectedLog)));
@@ -296,6 +327,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             await AwaitHostStateAsync(ScriptHostState.Running);
 
+            // need to reinitialize TestFunctionHost to reset IApplicationLifetime
+            await _fixture.InitializeAsync();
+
             // verify functions can be invoked
             await InvokeAndValidateHttpTrigger(functionName);
 
@@ -344,7 +378,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             Assert.Equal(16, metadata.Length);
             var function = metadata.Single(p => p.Name == "HttpTrigger-CustomRoute");
-            Assert.Equal("https://localhost/csharp/products/{category:alpha?}/{id:int?}/{extra?}", function.InvokeUrlTemplate.ToString());
+            Assert.Equal("https://localhost/api/csharp/products/{category:alpha?}/{id:int?}/{extra?}", function.InvokeUrlTemplate.ToString());
 
             function = metadata.Single(p => p.Name == "HttpTrigger");
             Assert.Equal("https://localhost/api/httptrigger", function.InvokeUrlTemplate.ToString());
@@ -589,7 +623,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 var product = JObject.Parse(json);
                 Assert.Equal("electronics", (string)product["category"]);
                 Assert.Equal(123, (int?)product["id"]);
-                var logs = _fixture.Host.GetLogMessages("Function.HttpTrigger-CustomRoute.User");
+                var logs = _fixture.Host.GetScriptHostLogMessages("Function.HttpTrigger-CustomRoute.User");
                 Assert.Contains(logs, l => string.Equals(l.FormattedMessage, "Parameters: category=electronics id=123 extra=extra"));
                 Assert.True(logs.Any(p => p.FormattedMessage.Contains("ProductInfo: Category=electronics Id=123")));
 
@@ -604,7 +638,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 product = JObject.Parse(json);
                 Assert.Equal("electronics", (string)product["category"]);
                 Assert.Null((int?)product["id"]);
-                logs = _fixture.Host.GetLogMessages("Function.HttpTrigger-CustomRoute.User");
+                logs = _fixture.Host.GetScriptHostLogMessages("Function.HttpTrigger-CustomRoute.User");
                 Assert.Contains(logs, l => string.Equals(l.FormattedMessage, "Parameters: category=electronics id= extra="));
 
                 // test optional category parameter
@@ -617,7 +651,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 product = JObject.Parse(json);
                 Assert.Null((string)product["category"]);
                 Assert.Null((int?)product["id"]);
-                logs = _fixture.Host.GetLogMessages("Function.HttpTrigger-CustomRoute.User");
+                logs = _fixture.Host.GetScriptHostLogMessages("Function.HttpTrigger-CustomRoute.User");
                 Assert.Contains(logs, l => string.Equals(l.FormattedMessage, "Parameters: category= id= extra="));
 
                 // test a constraint violation (invalid id)
@@ -681,6 +715,29 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
                 string[] identityStrings = StripBookendQuotations(responseContent).Split(';');
                 Assert.Equal("Identity: (facebook, Connor McMahon, 10241897674253170)", identityStrings[0]);
                 Assert.Equal("Identity: (WebJobsAuthLevel, Function, Key1)", identityStrings[1]);
+            }
+        }
+
+        [Fact]
+        public async Task HttpTrigger_Identities_AnonymousAccessSucceeds()
+        {
+            var vars = new Dictionary<string, string>
+            {
+                { LanguageWorkerConstants.FunctionWorkerRuntimeSettingName, LanguageWorkerConstants.DotNetLanguageWorkerName},
+                { "WEBSITE_AUTH_ENABLED", "TRUE"}
+            };
+            using (var env = new TestScopedEnvironmentVariable(vars))
+            {
+                string uri = $"api/httptrigger-identities";
+                HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, uri);
+
+                MockEasyAuth(request, "facebook", "Connor McMahon", "10241897674253170");
+
+                HttpResponseMessage response = await this._fixture.Host.HttpClient.SendAsync(request);
+                Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+                string responseContent = await response.Content.ReadAsStringAsync();
+                string[] identityStrings = StripBookendQuotations(responseContent).Split(';');
+                Assert.Equal("Identity: (facebook, Connor McMahon, 10241897674253170)", identityStrings[0]);
             }
         }
 

@@ -5,81 +5,77 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
+using System.Threading.Tasks;
 using System.Threading.Tasks.Dataflow;
-using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.Eventing.Rpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
+using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
 using Microsoft.Extensions.Logging;
-using Newtonsoft.Json;
+using Microsoft.Extensions.Options;
 
 using FunctionMetadata = Microsoft.Azure.WebJobs.Script.Description.FunctionMetadata;
 using MsgType = Microsoft.Azure.WebJobs.Script.Grpc.Messages.StreamingMessage.ContentOneofCase;
 
 namespace Microsoft.Azure.WebJobs.Script.Rpc
 {
-    internal class LanguageWorkerChannel : ILanguageWorkerChannel
+    internal class LanguageWorkerChannel : ILanguageWorkerChannel, IDisposable
     {
-        private readonly TimeSpan processStartTimeout = TimeSpan.FromSeconds(40);
         private readonly TimeSpan workerInitTimeout = TimeSpan.FromSeconds(30);
         private readonly string _rootScriptPath;
         private readonly IScriptEventManager _eventManager;
-        private readonly IWorkerProcessFactory _processFactory;
-        private readonly IProcessRegistry _processRegistry;
         private readonly WorkerConfig _workerConfig;
-        private readonly ILogger _workerChannelLogger;
-        private readonly ILogger _userLogsConsoleLogger;
+        private readonly string _runtime;
 
         private bool _disposed;
-        private IObservable<FunctionRegistrationContext> _functionRegistrations;
+        private bool _disposing;
+        private bool _isWebHostChannel;
         private WorkerInitResponse _initMessage;
         private string _workerId;
-        private Process _process;
+        private LanguageWorkerChannelState _state;
         private Queue<string> _processStdErrDataQueue = new Queue<string>(3);
-        private IDictionary<string, BufferBlock<ScriptInvocationContext>> _functionInputBuffers = new Dictionary<string, BufferBlock<ScriptInvocationContext>>();
         private IDictionary<string, Exception> _functionLoadErrors = new Dictionary<string, Exception>();
         private ConcurrentDictionary<string, ScriptInvocationContext> _executingInvocations = new ConcurrentDictionary<string, ScriptInvocationContext>();
+        private IDictionary<string, BufferBlock<ScriptInvocationContext>> _functionInputBuffers = new ConcurrentDictionary<string, BufferBlock<ScriptInvocationContext>>();
         private IObservable<InboundEvent> _inboundWorkerEvents;
         private List<IDisposable> _inputLinks = new List<IDisposable>();
         private List<IDisposable> _eventSubscriptions = new List<IDisposable>();
         private IDisposable _startSubscription;
         private IDisposable _startLatencyMetric;
-        private Uri _serverUri;
-
-        internal LanguageWorkerChannel()
-        {
-            // To help with unit tests
-        }
+        private IOptions<ManagedDependencyOptions> _managedDependencyOptions;
+        private IEnumerable<FunctionMetadata> _functions;
+        private Capabilities _workerCapabilities;
+        private ILogger _workerChannelLogger;
+        private ILanguageWorkerProcess _languageWorkerProcess;
+        private TaskCompletionSource<bool> _reloadTask = new TaskCompletionSource<bool>();
 
         internal LanguageWorkerChannel(
            string workerId,
            string rootScriptPath,
            IScriptEventManager eventManager,
-           IObservable<FunctionRegistrationContext> functionRegistrations,
-           IWorkerProcessFactory processFactory,
-           IProcessRegistry processRegistry,
            WorkerConfig workerConfig,
-           Uri serverUri,
-           ILoggerFactory loggerFactory,
+           ILanguageWorkerProcess languageWorkerProcess,
+           ILogger logger,
            IMetricsLogger metricsLogger,
-           int attemptCount)
+           int attemptCount,
+           bool isWebHostChannel = false,
+           IOptions<ManagedDependencyOptions> managedDependencyOptions = null)
         {
             _workerId = workerId;
-            _functionRegistrations = functionRegistrations;
             _rootScriptPath = rootScriptPath;
             _eventManager = eventManager;
-            _processFactory = processFactory;
-            _processRegistry = processRegistry;
             _workerConfig = workerConfig;
-            _serverUri = serverUri;
-            _workerChannelLogger = loggerFactory.CreateLogger($"Worker.{workerConfig.Language}.{_workerId}");
-            _userLogsConsoleLogger = loggerFactory.CreateLogger(LanguageWorkerConstants.FunctionConsoleLogCategoryName);
+            _runtime = workerConfig.Language;
+            _isWebHostChannel = isWebHostChannel;
+            _languageWorkerProcess = languageWorkerProcess;
+            _workerChannelLogger = logger;
+
+            _workerCapabilities = new Capabilities(_workerChannelLogger);
 
             _inboundWorkerEvents = _eventManager.OfType<InboundEvent>()
                 .Where(msg => msg.WorkerId == _workerId);
@@ -88,160 +84,43 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                 .Where(msg => msg.MessageType == MsgType.RpcLog)
                 .Subscribe(Log));
 
-            _eventSubscriptions.Add(_eventManager.OfType<RpcEvent>()
-                .Where(msg => msg.WorkerId == _workerId)
-                    .Subscribe(msg =>
-                    {
-                        var jsonMsg = JsonConvert.SerializeObject(msg, LanguageWorkerChannelUtilities.VerboseSerializerSettings);
-                        _userLogsConsoleLogger.LogDebug(jsonMsg);
-                    }));
-
             _eventSubscriptions.Add(_eventManager.OfType<FileEvent>()
-                .Where(msg => Config.Extensions.Contains(Path.GetExtension(msg.FileChangeArguments.FullPath)))
+                .Where(msg => _workerConfig.Extensions.Contains(Path.GetExtension(msg.FileChangeArguments.FullPath)))
                 .Throttle(TimeSpan.FromMilliseconds(300)) // debounce
                 .Subscribe(msg => _eventManager.Publish(new HostRestartEvent())));
 
+            _eventSubscriptions.Add(_inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.FunctionLoadResponse)
+                .Subscribe((msg) => LoadResponse(msg.Message.FunctionLoadResponse)));
+
+            _eventSubscriptions.Add(_inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.InvocationResponse)
+                .Subscribe((msg) => InvokeResponse(msg.Message.InvocationResponse)));
+
             _startLatencyMetric = metricsLogger?.LatencyEvent(string.Format(MetricEventNames.WorkerInitializeLatency, workerConfig.Language, attemptCount));
+            _managedDependencyOptions = managedDependencyOptions;
+
+            _state = LanguageWorkerChannelState.Default;
         }
 
         public string Id => _workerId;
 
-        public WorkerConfig Config => _workerConfig;
+        public IDictionary<string, BufferBlock<ScriptInvocationContext>> FunctionInputBuffers => _functionInputBuffers;
 
-        internal Queue<string> ProcessStdErrDataQueue => _processStdErrDataQueue;
+        public LanguageWorkerChannelState State => _state;
 
-        internal Process WorkerProcess => _process;
+        internal ILanguageWorkerProcess WorkerProcess => _languageWorkerProcess;
 
-        internal void StartProcess()
-        {
-            try
-            {
-                _process.ErrorDataReceived += (sender, e) => OnErrorDataReceived(sender, e);
-                _process.OutputDataReceived += (sender, e) => OnOutputDataReceived(sender, e);
-                _process.Exited += (sender, e) => OnProcessExited(sender, e);
-                _process.EnableRaisingEvents = true;
-
-                _workerChannelLogger?.LogInformation($"Starting language worker process:{_process.StartInfo.FileName} {_process.StartInfo.Arguments}");
-                _process.Start();
-                _workerChannelLogger?.LogInformation($"{_process.StartInfo.FileName} process with Id={_process.Id} started");
-
-                _process.BeginErrorReadLine();
-                _process.BeginOutputReadLine();
-            }
-            catch (Exception ex)
-            {
-                throw new HostInitializationException($"Failed to start Language Worker Channel for language :{_workerConfig.Language}", ex);
-            }
-        }
-
-        private void OnOutputDataReceived(object sender, DataReceivedEventArgs e)
-        {
-            if (e.Data != null)
-            {
-                string msg = e.Data;
-                if (LanguageWorkerChannelUtilities.IsLanguageWorkerConsoleLog(msg))
-                {
-                    msg = LanguageWorkerChannelUtilities.RemoveLogPrefix(msg);
-                    _workerChannelLogger?.LogInformation(msg);
-                }
-                else
-                {
-                    _userLogsConsoleLogger?.LogInformation(msg);
-                }
-            }
-        }
-
-        private void OnProcessExited(object sender, EventArgs e)
-        {
-            string exceptionMessage = string.Join(",", _processStdErrDataQueue.Where(s => !string.IsNullOrEmpty(s)));
-            try
-            {
-                if (_process.ExitCode != 0)
-                {
-                    var processExitEx = new LanguageWorkerProcessExitException($"{_process.StartInfo.FileName} exited with code {_process.ExitCode}\n {exceptionMessage}");
-                    processExitEx.ExitCode = _process.ExitCode;
-                    HandleWorkerError(processExitEx);
-                }
-                else
-                {
-                    _process.WaitForExit();
-                    _process.Close();
-                }
-            }
-            catch (Exception)
-            {
-                // ignore process is already disposed
-            }
-        }
-
-        private void OnErrorDataReceived(object sender, DataReceivedEventArgs e)
-        {
-            // TODO: per language stdout/err parser?
-            if (e.Data != null)
-            {
-                string msg = e.Data;
-                if (msg.IndexOf("warn", StringComparison.OrdinalIgnoreCase) > -1)
-                {
-                    if (LanguageWorkerChannelUtilities.IsLanguageWorkerConsoleLog(msg))
-                    {
-                        msg = LanguageWorkerChannelUtilities.RemoveLogPrefix(msg);
-                        _workerChannelLogger?.LogWarning(msg);
-                    }
-                    else
-                    {
-                        _userLogsConsoleLogger?.LogInformation(msg);
-                    }
-                }
-                else if ((msg.IndexOf("error", StringComparison.OrdinalIgnoreCase) > -1) ||
-                          (msg.IndexOf("fail", StringComparison.OrdinalIgnoreCase) > -1) ||
-                          (msg.IndexOf("severe", StringComparison.OrdinalIgnoreCase) > -1))
-                {
-                    if (LanguageWorkerChannelUtilities.IsLanguageWorkerConsoleLog(msg))
-                    {
-                        msg = LanguageWorkerChannelUtilities.RemoveLogPrefix(msg);
-                        _workerChannelLogger?.LogError(msg);
-                    }
-                    else
-                    {
-                        _userLogsConsoleLogger?.LogInformation(msg);
-                    }
-                    _processStdErrDataQueue = LanguageWorkerChannelUtilities.AddStdErrMessage(_processStdErrDataQueue, Sanitizer.Sanitize(msg));
-                }
-                else
-                {
-                    if (LanguageWorkerChannelUtilities.IsLanguageWorkerConsoleLog(msg))
-                    {
-                        msg = LanguageWorkerChannelUtilities.RemoveLogPrefix(msg);
-                        _workerChannelLogger?.LogInformation(msg);
-                    }
-                    else
-                    {
-                        _userLogsConsoleLogger?.LogInformation(msg);
-                    }
-                }
-            }
-        }
-
-        public void StartWorkerProcess()
+        public Task StartWorkerProcessAsync()
         {
             _startSubscription = _inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.StartStream)
-                .Timeout(processStartTimeout)
+                .Timeout(TimeSpan.FromSeconds(LanguageWorkerConstants.ProcessStartTimeoutSeconds))
                 .Take(1)
-                .Subscribe(SendWorkerInitRequest, HandleWorkerError);
+                .Subscribe(SendWorkerInitRequest, HandleWorkerChannelError);
 
-            var workerContext = new WorkerContext()
-            {
-                RequestId = Guid.NewGuid().ToString(),
-                MaxMessageLength = LanguageWorkerConstants.DefaultMaxMessageLengthBytes,
-                WorkerId = _workerId,
-                Arguments = _workerConfig.Arguments,
-                WorkingDirectory = _rootScriptPath,
-                ServerUri = _serverUri,
-            };
+            _languageWorkerProcess.StartProcess();
 
-            _process = _processFactory.CreateWorkerProcess(workerContext);
-            StartProcess();
-            _processRegistry?.Register(_process);
+            _state = LanguageWorkerChannelState.Initializing;
+
+            return Task.CompletedTask;
         }
 
         // send capabilities to worker, wait for WorkerInitResponse
@@ -250,7 +129,7 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
             _inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.WorkerInitResponse)
                 .Timeout(workerInitTimeout)
                 .Take(1)
-                .Subscribe(PublishRpcChannelReadyEvent, HandleWorkerError);
+                .Subscribe(PublishRpcChannelReadyEvent, HandleWorkerChannelError);
 
             SendStreamingMessage(new StreamingMessage
             {
@@ -261,10 +140,19 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
             });
         }
 
-        internal void PublishWorkerProcessReadyEvent(FunctionEnvironmentReloadResponse res)
+        internal void FunctionEnvironmentReloadResponse(FunctionEnvironmentReloadResponse res)
         {
-            WorkerProcessReadyEvent wpEvent = new WorkerProcessReadyEvent(_workerId, _workerConfig.Language);
-            _eventManager.Publish(wpEvent);
+            _workerChannelLogger.LogDebug("Received FunctionEnvironmentReloadResponse");
+            if (_reloadTask.Task.IsCompleted)
+            {
+                throw new InvalidOperationException("FunctionEnvironmentReloadResponse received more than once");
+            }
+            if (res.Result.IsFailure(out Exception relaodEnvironmentVariablesException))
+            {
+                _workerChannelLogger.LogError(relaodEnvironmentVariablesException, "Failed to reload environment variables");
+                _reloadTask.SetResult(false);
+            }
+            _reloadTask.SetResult(true);
         }
 
         internal void PublishRpcChannelReadyEvent(RpcEvent initEvent)
@@ -272,61 +160,101 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
             _startLatencyMetric?.Dispose();
             _startLatencyMetric = null;
 
+            if (_disposing)
+            {
+                // do not publish ready events when disposing
+                return;
+            }
             _initMessage = initEvent.Message.WorkerInitResponse;
             if (_initMessage.Result.IsFailure(out Exception exc))
             {
-                HandleWorkerError(exc);
+                HandleWorkerChannelError(exc);
                 return;
             }
-            if (_functionRegistrations == null)
+
+            _state = LanguageWorkerChannelState.Initialized;
+
+            _workerCapabilities.UpdateCapabilities(_initMessage.Capabilities);
+
+            if (_isWebHostChannel)
             {
-                RpcChannelReadyEvent readyEvent = new RpcChannelReadyEvent(_workerId, _workerConfig.Language, this, _initMessage.WorkerVersion, _initMessage.Capabilities);
+                _workerChannelLogger.LogDebug("Publishing RpcWebHostChannelReadyEvent for runtime:{language}, workerId:{id}", _workerConfig.Language, _workerId);
+                RpcWebHostChannelReadyEvent readyEvent = new RpcWebHostChannelReadyEvent(_workerId, _runtime, this, _initMessage.WorkerVersion, _initMessage.Capabilities);
                 _eventManager.Publish(readyEvent);
-                return;
             }
-            RegisterFunctions(_functionRegistrations);
+            else
+            {
+                _workerChannelLogger.LogDebug("Publishing RpcJobHostChannelReadyEvent for runtime:{language}, workerId:{id}", _workerConfig.Language, _workerId);
+                RpcJobHostChannelReadyEvent readyEvent = new RpcJobHostChannelReadyEvent(_workerId, _runtime, this, _initMessage.WorkerVersion, _initMessage.Capabilities);
+                _eventManager.Publish(readyEvent);
+            }
         }
 
-        public void RegisterFunctions(IObservable<FunctionRegistrationContext> functionRegistrations)
+        public void SetupFunctionInvocationBuffers(IEnumerable<FunctionMetadata> functions)
         {
-            _functionRegistrations = functionRegistrations ?? throw new ArgumentNullException(nameof(functionRegistrations));
-            _functionRegistrations = functionRegistrations;
-            _eventSubscriptions.Add(_functionRegistrations.Subscribe(SendFunctionLoadRequest));
-
-            _eventSubscriptions.Add(_inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.FunctionLoadResponse)
-                .Subscribe((msg) => LoadResponse(msg.Message.FunctionLoadResponse)));
-
-            _eventSubscriptions.Add(_inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.InvocationResponse)
-                .Subscribe((msg) => InvokeResponse(msg.Message.InvocationResponse)));
+            _functions = functions;
+            foreach (FunctionMetadata metadata in functions)
+            {
+                _workerChannelLogger.LogDebug("Setting up FunctionInvocationBuffer for function:{functionName} with functionId:{id}", metadata.Name, metadata.FunctionId);
+                _functionInputBuffers[metadata.FunctionId] = new BufferBlock<ScriptInvocationContext>();
+            }
         }
 
-        public void SendFunctionEnvironmentReloadRequest()
+        public void SendFunctionLoadRequests()
         {
-            _eventSubscriptions.Add(_inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.FunctionEnvironmentReloadResponse)
-      .Subscribe((msg) => PublishWorkerProcessReadyEvent(msg.Message.FunctionEnvironmentReloadResponse)));
+            if (_functions != null)
+            {
+                foreach (FunctionMetadata metadata in _functions)
+                {
+                    SendFunctionLoadRequest(metadata);
+                }
+            }
+        }
+
+        public Task SendFunctionEnvironmentReloadRequest()
+        {
+            _workerChannelLogger.LogDebug("Sending FunctionEnvironmentReloadRequest");
+            _eventSubscriptions
+                .Add(_inboundWorkerEvents.Where(msg => msg.MessageType == MsgType.FunctionEnvironmentReloadResponse)
+                .Timeout(workerInitTimeout)
+                .Take(1)
+                .Subscribe((msg) => FunctionEnvironmentReloadResponse(msg.Message.FunctionEnvironmentReloadResponse)));
 
             IDictionary processEnv = Environment.GetEnvironmentVariables();
 
-            FunctionEnvironmentReloadRequest request = new FunctionEnvironmentReloadRequest();
-            foreach (DictionaryEntry entry in processEnv)
-            {
-                request.EnvironmentVariables.Add(entry.Key.ToString(), entry.Value.ToString());
-            }
+            FunctionEnvironmentReloadRequest request = GetFunctionEnvironmentReloadRequest(processEnv);
 
             SendStreamingMessage(new StreamingMessage
             {
                 FunctionEnvironmentReloadRequest = request
             });
+
+            return _reloadTask.Task;
         }
 
-        internal void SendFunctionLoadRequest(FunctionRegistrationContext context)
+        internal FunctionEnvironmentReloadRequest GetFunctionEnvironmentReloadRequest(IDictionary processEnv)
         {
-            FunctionMetadata metadata = context.Metadata;
+            FunctionEnvironmentReloadRequest request = new FunctionEnvironmentReloadRequest();
+            foreach (DictionaryEntry entry in processEnv)
+            {
+                request.EnvironmentVariables.Add(entry.Key.ToString(), entry.Value.ToString());
+            }
+            return request;
+        }
 
-            // associate the invocation input buffer with the function
-            _functionInputBuffers[context.Metadata.FunctionId] = context.InputBuffer;
+        internal void SendFunctionLoadRequest(FunctionMetadata metadata)
+        {
+            _workerChannelLogger.LogDebug("Sending FunctionLoadRequest for function:{functionName} with functionId:{id}", metadata.Name, metadata.FunctionId);
 
             // send a load request for the registered function
+            SendStreamingMessage(new StreamingMessage
+            {
+                FunctionLoadRequest = GetFunctionLoadRequest(metadata)
+            });
+        }
+
+        internal FunctionLoadRequest GetFunctionLoadRequest(FunctionMetadata metadata)
+        {
             FunctionLoadRequest request = new FunctionLoadRequest()
             {
                 FunctionId = metadata.FunctionId,
@@ -335,36 +263,44 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                     Name = metadata.Name,
                     Directory = metadata.FunctionDirectory ?? string.Empty,
                     EntryPoint = metadata.EntryPoint ?? string.Empty,
-                    ScriptFile = metadata.ScriptFile ?? string.Empty
+                    ScriptFile = metadata.ScriptFile ?? string.Empty,
+                    IsProxy = metadata.IsProxy
                 }
             };
 
-            foreach (var binding in metadata.Bindings)
+            if (_managedDependencyOptions?.Value != null && _managedDependencyOptions.Value.Enabled)
             {
-                request.Metadata.Bindings.Add(binding.Name, new BindingInfo
-                {
-                    Direction = (BindingInfo.Types.Direction)binding.Direction,
-                    Type = binding.Type
-                });
+                _workerChannelLogger?.LogDebug($"Adding dependency download request to {_workerConfig.Language} language worker");
+                request.ManagedDependencyEnabled = _managedDependencyOptions.Value.Enabled;
             }
 
-            SendStreamingMessage(new StreamingMessage
+            foreach (var binding in metadata.Bindings)
             {
-                FunctionLoadRequest = request
-            });
+                BindingInfo bindingInfo = binding.ToBindingInfo();
+
+                request.Metadata.Bindings.Add(binding.Name, bindingInfo);
+            }
+            return request;
         }
 
         internal void LoadResponse(FunctionLoadResponse loadResponse)
         {
+            _workerChannelLogger.LogDebug("Received FunctionLoadResponse for functionId:{functionId}", loadResponse.FunctionId);
             if (loadResponse.Result.IsFailure(out Exception ex))
             {
                 //Cache function load errors to replay error messages on invoking failed functions
                 _functionLoadErrors[loadResponse.FunctionId] = ex;
             }
-            var inputBuffer = _functionInputBuffers[loadResponse.FunctionId];
+
+            if (loadResponse.IsDependencyDownloaded)
+            {
+                _workerChannelLogger?.LogInformation($"Managed dependency successfully downloaded by the {_workerConfig.Language} language worker");
+            }
+
             // link the invocation inputs to the invoke call
             var invokeBlock = new ActionBlock<ScriptInvocationContext>(ctx => SendInvocationRequest(ctx));
-            var disposableLink = inputBuffer.LinkTo(invokeBlock);
+            // associate the invocation input buffer with the function
+            var disposableLink = _functionInputBuffers[loadResponse.FunctionId].LinkTo(invokeBlock);
             _inputLinks.Add(disposableLink);
         }
 
@@ -397,7 +333,7 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                     {
                         if (pair.Value != null)
                         {
-                            invocationRequest.TriggerMetadata.Add(pair.Key, pair.Value.ToRpc());
+                            invocationRequest.TriggerMetadata.Add(pair.Key, pair.Value.ToRpc(_workerChannelLogger, _workerCapabilities));
                         }
                     }
                     foreach (var input in context.Inputs)
@@ -405,7 +341,7 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                         invocationRequest.InputData.Add(new ParameterBinding()
                         {
                             Name = input.name,
-                            Data = input.val.ToRpc()
+                            Data = input.val.ToRpc(_workerChannelLogger, _workerCapabilities)
                         });
                     }
 
@@ -425,18 +361,26 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
 
         internal void InvokeResponse(InvocationResponse invokeResponse)
         {
+            _workerChannelLogger.LogDebug("InvocationResponse received for invocation id: {Id}", invokeResponse.InvocationId);
             if (_executingInvocations.TryRemove(invokeResponse.InvocationId, out ScriptInvocationContext context)
                 && invokeResponse.Result.IsSuccess(context.ResultSource))
             {
-                IDictionary<string, object> bindingsDictionary = invokeResponse.OutputData
-                    .ToDictionary(binding => binding.Name, binding => binding.Data.ToObject());
-
-                var result = new ScriptInvocationResult()
+                try
                 {
-                    Outputs = bindingsDictionary,
-                    Return = invokeResponse?.ReturnValue?.ToObject()
-                };
-                context.ResultSource.SetResult(result);
+                    IDictionary<string, object> bindingsDictionary = invokeResponse.OutputData
+                        .ToDictionary(binding => binding.Name, binding => binding.Data.ToObject());
+
+                    var result = new ScriptInvocationResult()
+                    {
+                        Outputs = bindingsDictionary,
+                        Return = invokeResponse?.ReturnValue?.ToObject()
+                    };
+                    context.ResultSource.SetResult(result);
+                }
+                catch (Exception responseEx)
+                {
+                    context.ResultSource.TrySetException(responseEx);
+                }
             }
         }
 
@@ -460,25 +404,15 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                     }
                 }, null);
             }
-            else
-            {
-                _workerChannelLogger.Log(logLevel, new EventId(0, rpcLog.EventId), rpcLog.Message, null, (state, exc) => state);
-            }
         }
 
-        internal void HandleWorkerError(Exception exc)
+        internal void HandleWorkerChannelError(Exception exc)
         {
-            LanguageWorkerProcessExitException langExc = exc as LanguageWorkerProcessExitException;
-            // The subscriber of WorkerErrorEvent is expected to Dispose() the errored channel
-            if (langExc != null && langExc.ExitCode == -1)
+            if (_disposing)
             {
-                _workerChannelLogger.LogDebug(exc, $"Language Worker Process exited.", _process.StartInfo.FileName);
+                return;
             }
-            else
-            {
-                _workerChannelLogger.LogError(exc, $"Language Worker Process exited.", _process.StartInfo.FileName);
-            }
-            _eventManager.Publish(new WorkerErrorEvent(_workerConfig.Language, Id, exc));
+            _eventManager.Publish(new WorkerErrorEvent(_runtime, Id, exc));
         }
 
         private void SendStreamingMessage(StreamingMessage msg)
@@ -501,23 +435,7 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
                         link.Dispose();
                     }
 
-                    // best effort process disposal
-                    try
-                    {
-                        if (_process != null)
-                        {
-                            if (!_process.HasExited)
-                            {
-                                _process.Kill();
-                                _process.WaitForExit();
-                            }
-                            _process.Dispose();
-                        }
-                    }
-                    catch (Exception e)
-                    {
-                        _workerChannelLogger.LogError(e, "LanguageWorkerChannel Dispose failure");
-                    }
+                    (_languageWorkerProcess as IDisposable)?.Dispose();
 
                     foreach (var sub in _eventSubscriptions)
                     {
@@ -530,6 +448,7 @@ namespace Microsoft.Azure.WebJobs.Script.Rpc
 
         public void Dispose()
         {
+            _disposing = true;
             Dispose(true);
         }
     }

@@ -4,10 +4,12 @@
 using System.IO;
 using System.Net;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
+using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
@@ -23,6 +25,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private readonly HostController _hostController;
         private readonly Mock<IScriptHostManager> _mockScriptHostManager;
         private readonly Mock<IEnvironment> _mockEnvironment;
+        private readonly Mock<IFunctionsSyncManager> _functionsSyncManager;
 
         public HostControllerTests()
         {
@@ -39,8 +42,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEnvironment = new Mock<IEnvironment>(MockBehavior.Strict);
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.IsAny<string>())).Returns<string>(null);
             _mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
+            _functionsSyncManager = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
 
-            _hostController = new HostController(optionsWrapper, hostOptions, loggerFactory, mockAuthorizationService.Object, mockWebFunctionsManager.Object, _mockEnvironment.Object, _mockScriptHostManager.Object);
+            _hostController = new HostController(optionsWrapper, hostOptions, loggerFactory, mockAuthorizationService.Object, mockWebFunctionsManager.Object, _mockEnvironment.Object, _mockScriptHostManager.Object, _functionsSyncManager.Object);
 
             _appOfflineFilePath = Path.Combine(_scriptPath, ScriptConstants.AppOfflineFileName);
             if (File.Exists(_appOfflineFilePath))
@@ -86,6 +90,46 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             {
                 // verify file does not exist
                 Assert.False(fileExists);
+            }
+        }
+
+        [Fact]
+        public void GetAdminToken_Succeeds()
+        {
+            // Arrange
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.Is<string>(k => k == EnvironmentSettingNames.ContainerName))).Returns<string>(v => v = "ContainerName");
+
+            var key = TestHelpers.GenerateKeyBytes();
+            var stringKey = TestHelpers.GenerateKeyHexString(key);
+            using (new TestScopedEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, stringKey))
+            {
+                // Act
+                ObjectResult result = (ObjectResult)_hostController.GetAdminToken();
+                HttpStatusCode resultStatus = (HttpStatusCode)result.StatusCode;
+                string token = (string)result.Value;
+
+                // Assert
+                Assert.Equal(HttpStatusCode.OK, resultStatus);
+                Assert.True(SimpleWebTokenHelper.ValidateToken(token, new SystemClock()));
+            }
+        }
+
+        [Fact]
+        public void GetAdminToken_Fails_NotLinuxContainer()
+        {
+            // Arrange
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.Is<string>(k => k == EnvironmentSettingNames.ContainerName))).Returns<string>(v => v = null);
+
+            var key = TestHelpers.GenerateKeyBytes();
+            var stringKey = TestHelpers.GenerateKeyHexString(key);
+            using (new TestScopedEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, stringKey))
+            {
+                // Act
+                ObjectResult result = (ObjectResult)_hostController.GetAdminToken();
+                HttpStatusCode resultStatus = (HttpStatusCode)result.StatusCode;
+
+                // Assert
+                Assert.Equal(HttpStatusCode.BadRequest, resultStatus);
             }
         }
     }
