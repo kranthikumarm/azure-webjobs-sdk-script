@@ -82,6 +82,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AntaresLogIdHeaderName = "X-ARR-LOG-ID";
         public const string AntaresScaleOutHeaderName = "X-FUNCTION-SCALEOUT";
         public const string AntaresColdStartHeaderName = "X-MS-COLDSTART";
+        public const string SiteTokenHeaderName = "x-ms-site-restricted-token";
         public const string DynamicSku = "Dynamic";
         public const string DefaultProductionSlotName = "production";
 
@@ -105,6 +106,12 @@ namespace Microsoft.Azure.WebJobs.Script
 
         public const int MaximumHostIdLength = 32;
         public const int DynamicSkuConnectionLimit = 50;
+
+        /// <summary>
+        /// This constant is also defined in Antares, where the limit is ultimately enforced
+        /// for settriggers calls. If we raise that limit there, we should raise here as well.
+        /// </summary>
+        public const int MaxTriggersStringLength = 102400;
 
         public const string ExtensionsProjectFileName = "extensions.csproj";
         public const string MetadataGeneratorPackageId = "Microsoft.Azure.WebJobs.Script.ExtensionsMetadataGenerator";

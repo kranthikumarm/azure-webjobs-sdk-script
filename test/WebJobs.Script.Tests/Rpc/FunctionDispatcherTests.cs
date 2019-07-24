@@ -58,9 +58,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Rpc
 
             var finalChannelCount = await WaitForJobhostWorkerChannelsToStartup(functionDispatcher, expectedProcessCount);
             Assert.Equal(expectedProcessCount, finalChannelCount);
-
-            // Verify LanguageWorkerChannelState when channel after it is initialized
-            Assert.True(functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels().All(ch => ch.State == LanguageWorkerChannelState.Initialized));
         }
 
         [Fact]
@@ -288,8 +285,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Rpc
             await TestHelpers.Await(() =>
             {
                 currentChannelCount = functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels().Count();
-                return currentChannelCount == expectedCount;
-            }, pollingInterval: 5 * 1000, timeout: 60 * 1000);
+                if (currentChannelCount == expectedCount)
+                {
+                    return functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels().All(ch => ch.State == LanguageWorkerChannelState.Initialized);
+                }
+                return false;
+            }, pollingInterval: expectedCount * 5 * 1000, timeout: 60 * 1000);
             return currentChannelCount;
         }
 
