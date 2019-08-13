@@ -1,13 +1,13 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
-using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
 using Microsoft.Azure.WebJobs.Script.Rpc;
 using Microsoft.Extensions.Options;
 using Moq;
@@ -209,7 +209,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Rpc
         }
 
         [Fact]
-        public async void FunctionDispatcher_Restart_ErroredChannels_ExcceedsLimit()
+        public async void FunctionDispatcher_Restart_ErroredChannels_ExceedsLimit()
         {
             int expectedProcessCount = 2;
             FunctionDispatcher functionDispatcher = (FunctionDispatcher)GetTestFunctionDispatcher(expectedProcessCount.ToString());
@@ -225,6 +225,63 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Rpc
                 }
             }
             Assert.Equal(0, functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels().Count());
+        }
+
+        [Fact]
+        public async void FunctionDispatcher_Restart_ErroredChannels_OnWorkerRestart_NotAffectedByLimit()
+        {
+            int expectedProcessCount = 2;
+            FunctionDispatcher functionDispatcher = (FunctionDispatcher)GetTestFunctionDispatcher(expectedProcessCount.ToString());
+            await functionDispatcher.InitializeAsync(GetTestFunctionsList(LanguageWorkerConstants.NodeLanguageWorkerName));
+
+            await WaitForJobhostWorkerChannelsToStartup(functionDispatcher, expectedProcessCount);
+            for (int restartCount = 0; restartCount < expectedProcessCount * 3; restartCount++)
+            {
+                foreach (var channel in functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels())
+                {
+                    TestLanguageWorkerChannel testWorkerChannel = channel as TestLanguageWorkerChannel;
+                    testWorkerChannel.RaiseWorkerRestart();
+                }
+
+                var finalChannelCount = await WaitForJobhostWorkerChannelsToStartup(functionDispatcher, expectedProcessCount);
+                Assert.Equal(expectedProcessCount, finalChannelCount);
+            }
+        }
+
+        [Fact]
+        public async void FunctionDispatcher_Error_WithinThreshold_BucketFills()
+        {
+            FunctionDispatcher functionDispatcher = (FunctionDispatcher)GetTestFunctionDispatcher("1");
+            await functionDispatcher.InitializeAsync(GetTestFunctionsList(LanguageWorkerConstants.NodeLanguageWorkerName));
+            await WaitForJobhostWorkerChannelsToStartup(functionDispatcher, 1);
+            for (int i = 0; i < 3; ++i)
+            {
+                foreach (var channel in functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels())
+                {
+                    TestLanguageWorkerChannel testWorkerChannel = channel as TestLanguageWorkerChannel;
+                    testWorkerChannel.RaiseWorkerError();
+                }
+            }
+
+            Assert.Equal(3, functionDispatcher.LanguageWorkerErrors.Count);
+        }
+
+        [Fact]
+        public async void FunctionDispatcher_Error_BeyondThreshold_BucketIsAtOne()
+        {
+            FunctionDispatcher functionDispatcher = (FunctionDispatcher)GetTestFunctionDispatcher("1");
+            await functionDispatcher.InitializeAsync(GetTestFunctionsList(LanguageWorkerConstants.NodeLanguageWorkerName));
+            await WaitForJobhostWorkerChannelsToStartup(functionDispatcher, 1);
+            for (int i = 1; i < 10; ++i)
+            {
+                foreach (var channel in functionDispatcher.JobHostLanguageWorkerChannelManager.GetChannels())
+                {
+                    TestLanguageWorkerChannel testWorkerChannel = channel as TestLanguageWorkerChannel;
+                    testWorkerChannel.RaiseWorkerErrorWithCustomTimestamp(DateTime.UtcNow.AddHours(i));
+                }
+            }
+
+            Assert.Equal(1, functionDispatcher.LanguageWorkerErrors.Count);
         }
 
         private static FunctionDispatcher GetTestFunctionDispatcher(string maxProcessCountValue = null, bool addWebhostChannel = false, Mock<IWebHostLanguageWorkerChannelManager> mockwebHostLanguageWorkerChannelManager = null)
