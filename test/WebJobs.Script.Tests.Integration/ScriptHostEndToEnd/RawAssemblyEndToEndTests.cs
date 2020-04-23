@@ -10,7 +10,7 @@ using System.Net.Http.Headers;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Host;
-using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Azure.WebJobs.Script.Tests.Integration.Properties;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
@@ -63,7 +63,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         public void AssemblyChange_TriggersEnvironmentShutdown()
         {
             var manualResetEvent = new ManualResetEvent(false);
-            _fixture.ScriptJobHostEnvironmentMock.Setup(e => e.Shutdown())
+            _fixture.MockApplicationLifetime.Setup(e => e.StopApplication())
                 .Callback(() => manualResetEvent.Set());
 
             string sourceFile = TestFixture.SharedAssemblyPath;
@@ -84,7 +84,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public class TestFixture : ScriptHostEndToEndTestFixture
         {
-            private const string ScriptRoot = @"TestScripts\DotNet";
+            private static readonly string ScriptRoot = Path.Combine(@"TestScripts", "DotNet");
             private static readonly string Function1Path;
             private static readonly string Function2Path;
             private static readonly string Function3Path;
@@ -101,7 +101,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 CreateFunctionAssembly();
             }
 
-            public TestFixture() : base(ScriptRoot, "dotnet", LanguageWorkerConstants.DotNetLanguageWorkerName)
+            public TestFixture() : base(ScriptRoot, "dotnet", RpcWorkerConstants.DotNetLanguageWorkerName)
             {
             }
 

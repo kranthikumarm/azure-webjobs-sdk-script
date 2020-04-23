@@ -22,6 +22,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureWebJobsSecretStorageType = "AzureWebJobsSecretStorageType";
         public const string AzureWebJobsSecretStorageSas = "AzureWebJobsSecretStorageSas";
         public const string AppInsightsInstrumentationKey = "APPINSIGHTS_INSTRUMENTATIONKEY";
+        public const string AppInsightsConnectionString = "APPLICATIONINSIGHTS_CONNECTION_STRING";
         public const string AppInsightsQuickPulseAuthApiKey = "APPINSIGHTS_QUICKPULSEAUTHAPIKEY";
         public const string FunctionsExtensionVersion = "FUNCTIONS_EXTENSION_VERSION";
         public const string ContainerName = "CONTAINER_NAME";
@@ -37,9 +38,15 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureWebJobsSecretStorageKeyVaultConnectionString = "AzureWebJobsSecretStorageKeyVaultConnectionString";
         public const string AzureWebsiteArmCacheEnabled = "WEBSITE_FUNCTIONS_ARMCACHE_ENABLED";
         public const string MountEnabled = "WEBSITE_MOUNT_ENABLED";
+        public const string UserDataHome = "USER_DATA_HOME";
         public const string MsiEndpoint = "MSI_ENDPOINT";
         public const string MsiSecret = "MSI_SECRET";
         public const string DotnetSkipFirstTimeExperience = "DOTNET_SKIP_FIRST_TIME_EXPERIENCE";
+        public const string AzureFilesConnectionString = "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING";
+        public const string AzureFilesContentShare = "WEBSITE_CONTENTSHARE";
+        public const string AzureWebsiteRuntimeSiteName = "WEBSITE_DEPLOYMENT_ID";
+        public const string FunctionsRuntimeScaleMonitoringEnabled = "FUNCTIONS_RUNTIME_SCALE_MONITORING_ENABLED";
+        public const string AzureWebsiteStartupContextCache = "WEBSITE_FUNCTIONS_STARTUPCONTEXT_CACHE";
 
         /// <summary>
         /// Environment variable dynamically set by the platform when it is safe to
@@ -72,5 +79,13 @@ namespace Microsoft.Azure.WebJobs.Script
 
         public const string KubernetesServiceHost = "KUBERNETES_SERVICE_HOST";
         public const string KubernetesServiceHttpsPort = "KUBERNETES_SERVICE_PORT_HTTPS";
+        public const string FunctionsLogPath = "FUNCTIONS_LOG_PATH";
+        public const string FunctionsSecretsPath = "FUNCTIONS_SECRETS_PATH";
+        public const string FunctionsTestDataPath = "FUNCTIONS_TEST_DATA_PATH";
+        public const string MeshInitURI = "MESH_INIT_URI";
+
+        // CORS settings
+        public const string CorsAllowedOrigins = "CORS_ALLOWED_ORIGINS";
+        public const string CorsSupportCredentials = "CORS_SUPPORT_CREDENTIALS";
     }
 }

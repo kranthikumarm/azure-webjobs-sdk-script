@@ -16,28 +16,30 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
     /// <summary>
     /// Provides a logger for writing Worker and Function logs to specific files.
     /// </summary>
-    internal class FunctionFileLoggerProvider : ILoggerProvider
+    internal class FunctionFileLoggerProvider : ILoggerProvider, ISupportExternalScope
     {
-        private readonly ConcurrentDictionary<string, FileWriter> _fileWriterCache = new ConcurrentDictionary<string, FileWriter>(StringComparer.OrdinalIgnoreCase);
+        private readonly ConcurrentDictionary<string, IFileWriter> _fileWriterCache = new ConcurrentDictionary<string, IFileWriter>(StringComparer.OrdinalIgnoreCase);
         private readonly Func<bool> _isFileLoggingEnabled;
         private readonly Func<bool> _isPrimary;
         private readonly string _roogLogPath;
         private readonly string _hostInstanceId;
         private static readonly Regex _workerCategoryRegex = new Regex(@"^Worker\.[^\s]+\.[^\s]+");
-
+        private readonly IFileWriterFactory _fileWriterFactory;
+        private IExternalScopeProvider _scopeProvider;
         private bool _disposed = false;
 
         public FunctionFileLoggerProvider(IOptions<ScriptJobHostOptions> scriptOptions, IFileLoggingStatusManager fileLoggingStatusManager,
-            IPrimaryHostStateProvider primaryHostStateProvider)
+            IPrimaryHostStateProvider primaryHostStateProvider, IFileWriterFactory fileWriterFactory)
         {
             _roogLogPath = scriptOptions.Value.RootLogPath;
             _isFileLoggingEnabled = () => fileLoggingStatusManager.IsFileLoggingEnabled;
             _isPrimary = () => primaryHostStateProvider.IsPrimary;
             _hostInstanceId = scriptOptions.Value.InstanceId;
+            _fileWriterFactory = fileWriterFactory ?? throw new ArgumentNullException(nameof(fileWriterFactory));
         }
 
         // For testing
-        internal IDictionary<string, FileWriter> FileWriterCache => _fileWriterCache;
+        internal IDictionary<string, IFileWriter> FileWriterCache => _fileWriterCache;
 
         public ILogger CreateLogger(string categoryName)
         {
@@ -47,8 +49,8 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
             {
                 // Make sure that we return the same fileWriter if multiple loggers write to the same path. This happens
                 // with Function logs as Function.{FunctionName} and Function.{FunctionName}.User both go to the same file.
-                FileWriter fileWriter = _fileWriterCache.GetOrAdd(filePath, (p) => new FileWriter(Path.Combine(_roogLogPath, filePath)));
-                return new FileLogger(categoryName, fileWriter, _isFileLoggingEnabled, _isPrimary, LogType.Function);
+                IFileWriter fileWriter = _fileWriterCache.GetOrAdd(filePath, (p) => _fileWriterFactory.Create(Path.Combine(_roogLogPath, filePath)));
+                return new FileLogger(categoryName, fileWriter, _isFileLoggingEnabled, _isPrimary, LogType.Function, _scopeProvider);
             }
 
             // If it's not a supported category, we won't log anything from this provider.
@@ -73,15 +75,20 @@ namespace Microsoft.Azure.WebJobs.Script.Diagnostics
             return filePath;
         }
 
+        public void SetScopeProvider(IExternalScopeProvider scopeProvider)
+        {
+            _scopeProvider = scopeProvider;
+        }
+
         public void Dispose()
         {
             if (!_disposed)
             {
                 foreach (string fileWriterKey in _fileWriterCache.Keys)
                 {
-                    if (_fileWriterCache.TryRemove(fileWriterKey, out FileWriter fileWriter))
+                    if (_fileWriterCache.TryRemove(fileWriterKey, out IFileWriter fileWriter))
                     {
-                        fileWriter.Dispose();
+                        (fileWriter as IDisposable)?.Dispose();
                     }
                 }
 

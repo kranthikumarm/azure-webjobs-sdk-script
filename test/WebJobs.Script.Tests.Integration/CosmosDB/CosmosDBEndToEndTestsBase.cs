@@ -9,7 +9,7 @@ using Microsoft.Azure.Documents.Client;
 using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.WindowsAzure.Storage.Queue;
+using Microsoft.Azure.Storage.Queue;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.CosmosDB
@@ -97,7 +97,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.CosmosDB
                     new ExtensionPackageReference
                     {
                         Id = "Microsoft.Azure.WebJobs.Extensions.CosmosDB",
-                        Version = "3.0.2"
+                        Version = "3.0.4"
                     }
             };
         }

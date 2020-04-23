@@ -10,19 +10,22 @@ using Microsoft.Azure.WebJobs.Script.BindingExtensions;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.Models;
-using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
-using Microsoft.WindowsAzure.Storage;
-using Microsoft.WindowsAzure.Storage.Blob;
-using Microsoft.WindowsAzure.Storage.Queue;
-using Microsoft.WindowsAzure.Storage.Table;
+using Microsoft.Azure.Storage;
+using Microsoft.Azure.Storage.Blob;
+using Microsoft.Azure.Storage.Queue;
+using Microsoft.Azure.Cosmos.Table;
 using Moq;
 using Xunit;
+using CloudStorageAccount = Microsoft.Azure.Storage.CloudStorageAccount;
+using TableStorageAccount = Microsoft.Azure.Cosmos.Table.CloudStorageAccount;
+using System.Text;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
@@ -32,15 +35,16 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private string _copiedRootPath;
         private string _functionsWorkerRuntime;
         private int _workerProcessCount;
+        private string _functionsWorkerRuntimeVersion;
 
-        protected EndToEndTestFixture(string rootPath, string testId, string functionsWorkerRuntime, int workerProcessesCount = 1)
+        protected EndToEndTestFixture(string rootPath, string testId, string functionsWorkerRuntime, int workerProcessesCount = 1, string functionsWorkerRuntimeVersion = null)
         {
             FixtureId = testId;
 
             _rootPath = rootPath;
             _functionsWorkerRuntime = functionsWorkerRuntime;
             _workerProcessCount = workerProcessesCount;
-
+            _functionsWorkerRuntimeVersion = functionsWorkerRuntimeVersion;
         }
 
         public CloudBlobContainer TestInputContainer { get; private set; }
@@ -69,6 +73,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public TestEventGenerator EventGenerator { get; private set; } = new TestEventGenerator();
 
+        public string HostInstanceId => Host.JobHostServices.GetService<IOptions<ScriptJobHostOptions>>().Value.InstanceId;
+
+        public string MasterKey { get; private set; }
+
         protected virtual ExtensionPackageReference[] GetExtensionsToInstall()
         {
             return null;
@@ -95,8 +103,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             string logPath = Path.Combine(Path.GetTempPath(), @"Functions");
             if (!string.IsNullOrEmpty(_functionsWorkerRuntime))
             {
-                Environment.SetEnvironmentVariable(LanguageWorkerConstants.FunctionWorkerRuntimeSettingName, _functionsWorkerRuntime);
-                Environment.SetEnvironmentVariable(LanguageWorkerConstants.FunctionsWorkerProcessCountSettingName, _workerProcessCount.ToString());
+                Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, _functionsWorkerRuntime);
+                Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionsWorkerProcessCountSettingName, _workerProcessCount.ToString());
+            }
+            if (!string.IsNullOrEmpty(_functionsWorkerRuntimeVersion))
+            {
+                Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, _functionsWorkerRuntimeVersion);
             }
 
             FunctionsSyncManagerMock = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
@@ -122,9 +134,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
             QueueClient = storageAccount.CreateCloudQueueClient();
             BlobClient = storageAccount.CreateCloudBlobClient();
-            TableClient = storageAccount.CreateCloudTableClient();
+
+            TableStorageAccount tableStorageAccount = TableStorageAccount.Parse(connectionString);
+            TableClient = tableStorageAccount.CreateCloudTableClient();
 
             await CreateTestStorageEntities();
+
+            MasterKey = await Host.GetMasterKeyAsync();
         }
 
         public virtual void ConfigureScriptHost(IWebJobsBuilder webJobsBuilder)
@@ -227,18 +243,38 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     // best effort
                 }
             }
-            Environment.SetEnvironmentVariable(LanguageWorkerConstants.FunctionWorkerRuntimeSettingName, string.Empty);
-            Environment.SetEnvironmentVariable(LanguageWorkerConstants.FunctionsWorkerProcessCountSettingName, string.Empty);
+            Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName, string.Empty);
+            Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionsWorkerProcessCountSettingName, string.Empty);
+            Environment.SetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, string.Empty);
             return Task.CompletedTask;
+        }
+
+        public void AssertNoScriptHostErrors()
+        {
+            var logs = Host.GetScriptHostLogMessages();
+            var errors = logs.Where(x => x.Level == Microsoft.Extensions.Logging.LogLevel.Error).ToList();
+            if (errors.Count > 0)
+            {
+                var messageBuilder = new StringBuilder();
+
+                foreach (var e in errors)
+                    messageBuilder.AppendLine(e.FormattedMessage);
+
+                Assert.True(errors.Count == 0, messageBuilder.ToString());
+            }
         }
 
         private class TestExtensionBundleManager : IExtensionBundleManager
         {
-            public Task<string> GetExtensionBundlePath(HttpClient httpClient = null) => null;
+            public Task<ExtensionBundleDetails> GetExtensionBundleDetails() => Task.FromResult<ExtensionBundleDetails>(null);
 
-            public Task<string> GetExtensionBundlePath() => null;
+            public Task<string> GetExtensionBundlePath(HttpClient httpClient = null) => Task.FromResult<string>(null);
+
+            public Task<string> GetExtensionBundlePath() => Task.FromResult<string>(null);
 
             public bool IsExtensionBundleConfigured() => false;
+
+            public bool IsLegacyExtensionBundle() => false;
 
         }
 

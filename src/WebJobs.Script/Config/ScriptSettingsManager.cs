@@ -10,6 +10,10 @@ namespace Microsoft.Azure.WebJobs.Script.Config
     {
         private static ScriptSettingsManager _instance = new ScriptSettingsManager();
 
+        public ScriptSettingsManager() : this(null)
+        {
+        }
+
         public ScriptSettingsManager(IConfiguration config = null)
         {
             Configuration = config ?? BuildDefaultConfiguration();
@@ -35,33 +39,14 @@ namespace Microsoft.Azure.WebJobs.Script.Config
 
         public bool IsDynamicSku => WebsiteSku == ScriptConstants.DynamicSku;
 
-        /// <summary>
-        /// Gets a value that uniquely identifies the site and slot.
-        /// </summary>
-        // TODO: DI (FACAVAL) Remove all usage here. Moved to EnvironmentUtility
-        public virtual string AzureWebsiteUniqueSlotName
-        {
-            get
-            {
-                string name = GetSetting(EnvironmentSettingNames.AzureWebsiteName);
-                string slotName = GetSetting(EnvironmentSettingNames.AzureWebsiteSlotName);
-
-                if (!string.IsNullOrEmpty(slotName) &&
-                    !string.Equals(slotName, ScriptConstants.DefaultProductionSlotName, StringComparison.OrdinalIgnoreCase))
-                {
-                    name += $"-{slotName}";
-                }
-
-                return name?.ToLowerInvariant();
-            }
-        }
+        public bool IsElasticPremiumSku => WebsiteSku == ScriptConstants.ElasticPremiumSku;
 
         public virtual string AzureWebsiteInstanceId
          {
              get
              {
                  string instanceId = GetSetting(EnvironmentSettingNames.AzureWebsiteInstanceId)
-                     ?? Environment.MachineName.GetHashCode().ToString("X").PadLeft(32, '0');
+                     ?? Utility.GetStableHash(Environment.MachineName).ToString("X").PadLeft(32, '0');
 
                  return instanceId.Substring(0, Math.Min(instanceId.Length, 32));
              }
@@ -71,6 +56,12 @@ namespace Microsoft.Azure.WebJobs.Script.Config
         {
             get => GetSetting(EnvironmentSettingNames.AppInsightsInstrumentationKey);
             set => SetSetting(EnvironmentSettingNames.AppInsightsInstrumentationKey, value);
+        }
+
+        public virtual string ApplicationInsightsConnectionString
+        {
+            get => GetSetting(EnvironmentSettingNames.AppInsightsConnectionString);
+            set => SetSetting(EnvironmentSettingNames.AppInsightsConnectionString, value);
         }
 
         public virtual string GetSetting(string settingKey)

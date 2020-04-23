@@ -3,6 +3,18 @@
 {
   "runtimeAssemblies": [
     {
+      "name": "DotNetTI.BreakingChangeAnalysis",
+      "resolutionPolicy": "private"
+    },
+    {
+      "name": "Marklio.Metadata",
+      "resolutionPolicy": "private"
+    },
+    {
+      "name": "Microsoft.ApplicationInsights",
+      "resolutionPolicy": "runtimeVersion"
+    },
+    {
       "name": "Microsoft.AspNetCore",
       "resolutionPolicy": "minorMatchOrLower"
     },
@@ -383,6 +395,10 @@
       "resolutionPolicy": "minorMatchOrLower"
     },
     {
+      "name": "Microsoft.Azure.WebJobs.Host.Storage",
+      "resolutionPolicy": "minorMatchOrLower"
+    },
+    {
       "name": "Microsoft.Azure.WebJobs.Extensions",
       "resolutionPolicy": "minorMatchOrLower"
     },
@@ -735,6 +751,10 @@
       "resolutionPolicy": "minorMatchOrLower"
     },
     {
+      "name": "protobuf-net",
+      "resolutionPolicy": "private"
+    },
+    {
       "name": "SOS.NETCore",
       "resolutionPolicy": "minorMatchOrLower"
     },
@@ -839,19 +859,11 @@
       "resolutionPolicy": "minorMatchOrLower"
     },
     {
-      "name": "System.Data.SqlClient",
-      "resolutionPolicy": "minorMatchOrLower"
-    },
-    {
       "name": "System.Diagnostics.Contracts",
       "resolutionPolicy": "minorMatchOrLower"
     },
     {
       "name": "System.Diagnostics.Debug",
-      "resolutionPolicy": "minorMatchOrLower"
-    },
-    {
-      "name": "System.Diagnostics.DiagnosticSource",
       "resolutionPolicy": "minorMatchOrLower"
     },
     {
@@ -1179,10 +1191,6 @@
       "resolutionPolicy": "minorMatchOrLower"
     },
     {
-      "name": "System.Runtime.CompilerServices.Unsafe",
-      "resolutionPolicy": "minorMatchOrLower"
-    },
-    {
       "name": "System.Runtime.CompilerServices.VisualC",
       "resolutionPolicy": "minorMatchOrLower"
     },
@@ -1324,10 +1332,6 @@
     },
     {
       "name": "System.Text.Encoding.Extensions",
-      "resolutionPolicy": "minorMatchOrLower"
-    },
-    {
-      "name": "System.Text.Encodings.Web",
       "resolutionPolicy": "minorMatchOrLower"
     },
     {

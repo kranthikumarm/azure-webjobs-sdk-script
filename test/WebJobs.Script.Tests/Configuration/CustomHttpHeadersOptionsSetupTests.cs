@@ -50,9 +50,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
                     }")]
         [InlineData(@"{
                     'version': '2.0',
-                    'http': {
-                        'customHeaders': {
-                            'X-Content-Type-Options': 'nosniff'
+                    'extensions': {
+                            'http': {
+                                'customHeaders': {
+                                    'X-Content-Type-Options': 'nosniff'
+                                }
                             }
                         }
                     }")]
@@ -71,13 +73,15 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         public void ValidCustomHttpHeadersConfig_BindsToOptions()
         {
             string hostJsonContent = @"{
-                                         'version': '2.0',
-                                         'http': {
-                                             'customHeaders': {
-                                                 'X-Content-Type-Options': 'nosniff'
-                                             }
-                                         }
-                                     }";
+                                        'version': '2.0',
+                                        'extensions': {
+                                                'http': {
+                                                    'customHeaders': {
+                                                        'X-Content-Type-Options': 'nosniff'
+                                                    }
+                                                }
+                                            }
+                                        }";
             File.WriteAllText(_hostJsonFile, hostJsonContent);
             var configuration = BuildHostJsonConfiguration();
 
@@ -90,11 +94,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Configuration
         private IConfiguration BuildHostJsonConfiguration(IEnvironment environment = null)
         {
             environment = environment ?? new TestEnvironment();
-
             var loggerFactory = new LoggerFactory();
             loggerFactory.AddProvider(_loggerProvider);
 
-            var configSource = new HostJsonFileConfigurationSource(_options, environment, loggerFactory);
+            var configSource = new HostJsonFileConfigurationSource(_options, environment, loggerFactory, new TestMetricsLogger());
 
             var configurationBuilder = new ConfigurationBuilder()
                 .Add(configSource);

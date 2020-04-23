@@ -10,8 +10,8 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.Management.Models;
-using Microsoft.Azure.WebJobs.Script.Rpc;
 using Microsoft.Azure.WebJobs.Script.WebHost.Extensions;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
@@ -24,12 +24,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         private readonly IOptionsMonitor<ScriptApplicationHostOptions> _applicationHostOptions;
         private readonly ILogger _logger;
         private readonly HttpClient _client;
-        private readonly IEnumerable<WorkerConfig> _workerConfigs;
+        private readonly IEnumerable<RpcWorkerConfig> _workerConfigs;
         private readonly ISecretManagerProvider _secretManagerProvider;
         private readonly IFunctionsSyncManager _functionsSyncManager;
         private readonly HostNameProvider _hostNameProvider;
+        private readonly IFunctionMetadataProvider _functionMetadataProvider;
 
-        public WebFunctionsManager(IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, IOptions<LanguageWorkerOptions> languageWorkerOptions, ILoggerFactory loggerFactory, HttpClient client, ISecretManagerProvider secretManagerProvider, IFunctionsSyncManager functionsSyncManager, HostNameProvider hostNameProvider)
+        public WebFunctionsManager(IOptionsMonitor<ScriptApplicationHostOptions> applicationHostOptions, IOptions<LanguageWorkerOptions> languageWorkerOptions, ILoggerFactory loggerFactory, HttpClient client, ISecretManagerProvider secretManagerProvider, IFunctionsSyncManager functionsSyncManager, HostNameProvider hostNameProvider, IFunctionMetadataProvider functionMetadataProvider)
         {
             _applicationHostOptions = applicationHostOptions;
             _logger = loggerFactory?.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
@@ -38,12 +39,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             _secretManagerProvider = secretManagerProvider;
             _functionsSyncManager = functionsSyncManager;
             _hostNameProvider = hostNameProvider;
+            _functionMetadataProvider = functionMetadataProvider;
         }
 
         public async Task<IEnumerable<FunctionMetadataResponse>> GetFunctionsMetadata(bool includeProxies)
         {
             var hostOptions = _applicationHostOptions.CurrentValue.ToHostOptions();
-            var functionsMetadata = GetFunctionsMetadata(hostOptions, _workerConfigs, _logger, includeProxies);
+            var functionsMetadata = GetFunctionsMetadata(hostOptions, _logger, includeProxies);
 
             return await GetFunctionMetadataResponse(functionsMetadata, hostOptions, _hostNameProvider);
         }
@@ -57,10 +59,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
             return await tasks.WhenAll();
         }
 
-        internal static IEnumerable<FunctionMetadata> GetFunctionsMetadata(ScriptJobHostOptions hostOptions, IEnumerable<WorkerConfig> workerConfigs, ILogger logger, bool includeProxies = false)
+        internal IEnumerable<FunctionMetadata> GetFunctionsMetadata(ScriptJobHostOptions hostOptions, ILogger logger, bool includeProxies = false)
         {
-            var functionDirectories = FileUtility.EnumerateDirectories(hostOptions.RootScriptPath);
-            IEnumerable<FunctionMetadata> functionsMetadata = FunctionMetadataManager.ReadFunctionsMetadata(functionDirectories, null, workerConfigs, logger, fileSystem: FileUtility.Instance);
+            IEnumerable<FunctionMetadata> functionsMetadata = _functionMetadataProvider.GetFunctionMetadata();
 
             if (includeProxies)
             {
@@ -162,10 +163,10 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         /// <returns>(success, FunctionMetadataResponse)</returns>
         public async Task<(bool, FunctionMetadataResponse)> TryGetFunction(string name, HttpRequest request)
         {
-            // TODO: DI (FACAVAL) Follow up with ahmels - Since loading of function metadata is no longer tied to the script host, we
-            // should be able to inject an IFunctionMetadataManager here and bypass this step.
             var hostOptions = _applicationHostOptions.CurrentValue.ToHostOptions();
-            var functionMetadata = FunctionMetadataManager.ReadFunctionMetadata(Path.Combine(hostOptions.RootScriptPath, name), null, _workerConfigs, new Dictionary<string, ICollection<string>>(), fileSystem: FileUtility.Instance);
+            var functionMetadata = _functionMetadataProvider.GetFunctionMetadata(true)
+                .FirstOrDefault(metadata => Utility.FunctionNamesMatch(metadata.Name, name));
+
             if (functionMetadata != null)
             {
                 string routePrefix = await GetRoutePrefix(hostOptions.RootScriptPath);
@@ -183,7 +184,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
         /// </summary>
         /// <param name="function">Function to be deleted</param>
         /// <returns>(success, errorMessage)</returns>
-        public (bool, string) TryDeleteFunction(FunctionMetadataResponse function)
+        public async Task<(bool, string)> TryDeleteFunction(FunctionMetadataResponse function)
         {
             try
             {
@@ -196,7 +197,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Management
 
                 DeleteFunctionArtifacts(function);
 
-                _functionsSyncManager.TrySyncTriggersAsync();
+                await _functionsSyncManager.TrySyncTriggersAsync();
 
                 return (true, string.Empty);
             }

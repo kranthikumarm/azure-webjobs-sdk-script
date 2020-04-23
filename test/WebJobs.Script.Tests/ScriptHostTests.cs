@@ -15,8 +15,9 @@ using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Eventing;
-using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -24,6 +25,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Newtonsoft.Json.Linq;
+using WebJobs.Script.Tests;
 using Xunit;
 using FunctionMetadata = Microsoft.Azure.WebJobs.Script.Description.FunctionMetadata;
 
@@ -41,6 +43,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         public ScriptHostTests(TestFixture fixture)
         {
+            Utility.ColdStartDelayMS = 50;
             _fixture = fixture;
             _settingsManager = ScriptSettingsManager.Instance;
 
@@ -88,17 +91,36 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public static async Task OnDebugModeFileChanged_TriggeredWhenDebugFileUpdated()
         {
+            var loggerProvider = new TestLoggerProvider();
+            var loggerFactory = new LoggerFactory();
+            loggerFactory.AddProvider(loggerProvider);
+
             var host = new HostBuilder()
-                .ConfigureDefaultTestWebScriptHost(runStartupHostedServices: true)
+                 .ConfigureDefaultTestWebScriptHost(_ => { },
+                options =>
+                {
+                    options.ScriptPath = Path.GetTempPath();
+                    options.LogPath = Path.GetTempPath();
+                },
+                runStartupHostedServices: true,
+                rootServices =>
+                {
+                    rootServices.AddSingleton<ILoggerFactory>(loggerFactory);
+                })
+                .ConfigureServices(s =>
+                {
+                    s.AddSingleton<ILoggerFactory>(loggerFactory);
+                })
                 .Build();
 
             ScriptHost scriptHost = host.GetScriptHost();
-            string debugSentinelFilePath = Path.Combine(scriptHost.ScriptOptions.RootLogPath, "Host", ScriptConstants.DebugSentinelFileName);
 
-            // Write the initial file.
+            string debugSentinelDirectory = Path.Combine(scriptHost.ScriptOptions.RootLogPath, "Host");
+            string debugSentinelFilePath = Path.Combine(debugSentinelDirectory, ScriptConstants.DebugSentinelFileName);
             if (!File.Exists(debugSentinelFilePath))
             {
-                File.WriteAllText(debugSentinelFilePath, string.Empty);
+                FileUtility.EnsureDirectoryExists(debugSentinelDirectory);
+                File.WriteAllText(debugSentinelFilePath, "This is a system managed marker file used to control runtime debug mode behavior.");
             }
 
             // first put the host into a non-debug state
@@ -112,6 +134,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 return !scriptHost.InDebugMode;
             },
             userMessageCallback: () => $"Expected InDebugMode to be false. Now: {DateTime.UtcNow}; Sentinel LastWriteTime: {File.GetLastWriteTimeUtc(debugSentinelFilePath)}; LastDebugNotify: {debugState.LastDebugNotify}.");
+
+            // File Watchers for debug and diagnostic task are delayed during startup
+            // for dynamic skus
+            await TestHelpers.Await(() =>
+            {
+                return loggerProvider.GetAllLogMessages().Any(m => m.FormattedMessage.Contains("Debug file watch initialized."));
+            }, timeout: 2 * Utility.ColdStartDelayMS, userMessageCallback: () => $"File watchers did not initialize in time");
 
             // verify that our file watcher for the debug sentinel file is configured
             // properly by touching the file and ensuring that our host goes into
@@ -172,7 +201,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             var debugManager = _fixture.Host.Services.GetService<IDebugManager>();
 
             string debugSentinelFileName = Path.Combine(host.ScriptOptions.RootLogPath, "Host", ScriptConstants.DebugSentinelFileName);
-            File.Delete(debugSentinelFileName);
+            if (File.Exists(debugSentinelFileName))
+            {
+                File.Delete(debugSentinelFileName);
+            }
+
             debugState.LastDebugNotify = DateTime.MinValue;
 
             Assert.False(host.InDebugMode);
@@ -302,8 +335,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
                 File.WriteAllText(Path.Combine(rootPath, ScriptConstants.HostMetadataFileName), config.ToString());
                 File.WriteAllText(Path.Combine(invalidFunctionNamePath, ScriptConstants.FunctionMetadataFileName), string.Empty);
-
-                var environment = new Mock<IScriptJobHostEnvironment>();
                 var eventManager = new Mock<IScriptEventManager>();
 
                 IHost host = new HostBuilder()
@@ -368,32 +399,97 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         {
             try
             {
-                string rootPath = Path.Combine(Path.GetTempPath(), Guid.NewGuid().ToString());
-                var loggerProvider = new TestLoggerProvider();
-                var environment = new TestEnvironment();
-                environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, Guid.NewGuid().ToString("N"));
-                environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsExtensionVersion, "latest");
+                using (var tempDirectory = new TempDirectory())
+                {
+                    string rootPath = Path.Combine(tempDirectory.Path, Guid.NewGuid().ToString());
+                    Directory.CreateDirectory(rootPath);
+                    var loggerProvider = new TestLoggerProvider();
+                    var environment = new TestEnvironment();
+                    environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteInstanceId, Guid.NewGuid().ToString("N"));
+                    environment.SetEnvironmentVariable(EnvironmentSettingNames.FunctionsExtensionVersion, "latest");
 
-                EnvironmentExtensions.BaseDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "SiteExtensions", "Functions", "2.0.0");
+                    EnvironmentExtensions.BaseDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "SiteExtensions", "Functions", "2.0.0");
 
-                IHost host = new HostBuilder()
-                    .ConfigureServices(s =>
-                    {
-                        s.AddSingleton<IEnvironment>(environment);
-                    })
-                    .ConfigureLogging(l =>
-                    {
-                        l.AddProvider(loggerProvider);
-                    })
-                    .ConfigureDefaultTestWebScriptHost(o =>
-                    {
-                        o.ScriptPath = rootPath;
-                    })
-                    .Build();
+                    IHost host = new HostBuilder()
+                        .ConfigureServices(s =>
+                        {
+                            s.AddSingleton<IEnvironment>(environment);
+                        })
+                        .ConfigureLogging(l =>
+                        {
+                            l.AddProvider(loggerProvider);
+                        })
+                        .ConfigureDefaultTestWebScriptHost(o =>
+                        {
+                            o.ScriptPath = rootPath;
+                        })
+                        .Build();
 
-                var scriptHost = host.GetScriptHost();
-                await scriptHost.InitializeAsync();
-                Assert.Single(loggerProvider.GetAllLogMessages(), m => m.Level == LogLevel.Warning && m.FormattedMessage.StartsWith("Site extension version currently set to 'latest'."));
+                    var scriptHost = host.GetScriptHost();
+                    await scriptHost.InitializeAsync();
+                    Assert.Single(loggerProvider.GetAllLogMessages(), m => m.Level == LogLevel.Warning && m.FormattedMessage.StartsWith("Site extension version currently set to 'latest'."));
+                }
+            }
+            finally
+            {
+                EnvironmentExtensions.BaseDirectory = null;
+            }
+        }
+
+        [Theory]
+        [InlineData("dotnet", "", "", "dotnet")]
+        [InlineData("dotnet", "", "~2", "dotnet-~2")]
+        [InlineData("python", "~2", "", "python")]
+        [InlineData("python", "~2", "3.6", "python-3.6")]
+        [InlineData("python", "~3", "3.7", "python-3.7")]
+        [InlineData("node", "~3", "~8", "node-~8")]
+        [InlineData("node", "~2", "~8", "node-~8")]
+        [InlineData("powershell", "~2", "", "powershell")]
+        [InlineData("powershell", "~2", "~7", "powershell-~7")]
+        [InlineData("java", "~3", "", "java")]
+        public async Task Initialize_WithRuntimeAndWorkerVersion_ReportRuntimeToMetricsTable(
+            string functionsWorkerRuntime,
+            string functionsExtensionVersion,
+            string functionsWorkerRuntimeVersion,
+            string expectedRuntimeStack)
+        {
+            try
+            {
+                using (var tempDirectory = new TempDirectory())
+                {
+                    string rootPath = Path.Combine(tempDirectory.Path, Guid.NewGuid().ToString());
+                    Directory.CreateDirectory(rootPath);
+                    var metricsLogger = new TestMetricsLogger();
+                    var environment = new TestEnvironment();
+
+                    environment.SetEnvironmentVariable(
+                        RpcWorkerConstants.FunctionWorkerRuntimeSettingName, functionsWorkerRuntime);
+                    environment.SetEnvironmentVariable(
+                        EnvironmentSettingNames.FunctionsExtensionVersion, functionsExtensionVersion);
+                    environment.SetEnvironmentVariable(
+                        RpcWorkerConstants.FunctionWorkerRuntimeVersionSettingName, functionsWorkerRuntimeVersion);
+
+                    IHost host = new HostBuilder()
+                        .ConfigureServices(s =>
+                        {
+                            s.AddSingleton<IEnvironment>(environment);
+                        })
+                        .ConfigureDefaultTestWebScriptHost(
+                        null,
+                        o =>
+                        {
+                            o.ScriptPath = rootPath;
+                        },
+                        false,
+                        s =>
+                        {
+                            s.AddSingleton<IMetricsLogger>(metricsLogger);
+                        })
+                        .Build();
+                    var scriptHost = host.GetScriptHost();
+                    await scriptHost.InitializeAsync();
+                    Assert.Single(metricsLogger.LoggedEvents, e => e.Equals($"host.startup.runtime.language.{expectedRuntimeStack}"));
+                }
             }
             finally
             {
@@ -900,13 +996,44 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         [Fact]
         public void IsSupportedRuntime_Returns_False()
         {
-            Assert.False(Utility.IsSupportedRuntime(LanguageWorkerConstants.DotNetLanguageWorkerName, TestHelpers.GetTestWorkerConfigs()));
+            Assert.False(Utility.IsSupportedRuntime(RpcWorkerConstants.DotNetLanguageWorkerName, TestHelpers.GetTestWorkerConfigs()));
         }
 
         [Fact]
         public void IsSupportedRuntime_Returns_True()
         {
-            Assert.True(Utility.IsSupportedRuntime(LanguageWorkerConstants.NodeLanguageWorkerName, TestHelpers.GetTestWorkerConfigs()));
+            Assert.True(Utility.IsSupportedRuntime(RpcWorkerConstants.NodeLanguageWorkerName, TestHelpers.GetTestWorkerConfigs()));
+        }
+
+        [Fact]
+        public void GetWorkerRuntime_Returns_null()
+        {
+            FunctionMetadata funcJs1 = new FunctionMetadata()
+            {
+                Name = "funcJs1",
+                Language = "node"
+            };
+            FunctionMetadata funcPython1 = new FunctionMetadata()
+            {
+                Name = "funcPython1",
+                Language = null,
+            };
+            IEnumerable<FunctionMetadata> functionsList = new Collection<FunctionMetadata>()
+            {
+                funcJs1, funcPython1
+            };
+            string actualRuntime = Utility.GetWorkerRuntime(functionsList);
+            Assert.Equal(null, actualRuntime);
+
+            FunctionMetadata funcLanguageNull = new FunctionMetadata()
+            {
+                Name = "func"
+            };
+            functionsList = new Collection<FunctionMetadata>()
+            {
+                funcJs1, funcPython1, funcLanguageNull
+            };
+            Assert.Equal(null, actualRuntime);
         }
 
         [Theory]
@@ -953,8 +1080,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 funcJS1
             };
 
-            HostInitializationException ex = Assert.Throws<HostInitializationException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, LanguageWorkerConstants.DotNetLanguageWorkerName));
-            Assert.Equal($"Did not find functions with language [{LanguageWorkerConstants.DotNetLanguageWorkerName}].", ex.Message);
+            HostInitializationException ex = Assert.Throws<HostInitializationException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, RpcWorkerConstants.DotNetLanguageWorkerName, false, false));
+            Assert.Equal($"Did not find functions with language [{RpcWorkerConstants.DotNetLanguageWorkerName}].", ex.Message);
         }
 
         [Fact]
@@ -976,7 +1103,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 funcJS1, funcCS1
             };
 
-            Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, LanguageWorkerConstants.DotNetLanguageWorkerName);
+            Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, RpcWorkerConstants.DotNetLanguageWorkerName, false, false);
         }
 
         [Fact]
@@ -992,7 +1119,24 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 funcJS1
             };
 
-            Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty);
+            Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, false, false);
+        }
+
+        [Theory]
+        [InlineData(true, true)]
+        [InlineData(true, false)]
+        public void VerifyFunctionsMatchSpecifiedLanguage_NoThrow_For_HttpWorkerOrPlaceholderMode(bool placeholderMode, bool httpWorker)
+        {
+            FunctionMetadata funcJS1 = new FunctionMetadata()
+            {
+                Name = "funcJS1"
+            };
+            IEnumerable<FunctionMetadata> functionsList = new Collection<FunctionMetadata>()
+            {
+                funcJS1
+            };
+
+            Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, placeholderMode, httpWorker);
         }
 
         [Fact]
@@ -1013,8 +1157,8 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 funcJS1, funcCS1
             };
 
-            HostInitializationException ex = Assert.Throws<HostInitializationException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty));
-            Assert.Equal($"Found functions with more than one language. Select a language for your function app by specifying {LanguageWorkerConstants.FunctionWorkerRuntimeSettingName} AppSetting", ex.Message);
+            HostInitializationException ex = Assert.Throws<HostInitializationException>(() => Utility.VerifyFunctionsMatchSpecifiedLanguage(functionsList, string.Empty, false, false));
+            Assert.Equal($"Found functions with more than one language. Select a language for your function app by specifying {RpcWorkerConstants.FunctionWorkerRuntimeSettingName} AppSetting", ex.Message);
         }
 
         [Fact]
@@ -1320,7 +1464,6 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             public async Task InitializeAsync()
             {
                 Directory.CreateDirectory(TestHelpers.FunctionsTestDirectory);
-                var environment = new Mock<IScriptJobHostEnvironment>();
                 var eventManager = new Mock<IScriptEventManager>();
 
                 Host = new HostBuilder()

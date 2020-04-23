@@ -1,15 +1,21 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
 using System.IO;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Azure.WebJobs.Host.Scale;
+using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
+using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Azure.WebJobs.Script.WebHost.Controllers;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
-using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
@@ -26,6 +32,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         private readonly Mock<IScriptHostManager> _mockScriptHostManager;
         private readonly Mock<IEnvironment> _mockEnvironment;
         private readonly Mock<IFunctionsSyncManager> _functionsSyncManager;
+        private readonly Mock<IExtensionBundleManager> _extensionBundleManager;
 
         public HostControllerTests()
         {
@@ -43,6 +50,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.IsAny<string>())).Returns<string>(null);
             _mockScriptHostManager = new Mock<IScriptHostManager>(MockBehavior.Strict);
             _functionsSyncManager = new Mock<IFunctionsSyncManager>(MockBehavior.Strict);
+            _extensionBundleManager = new Mock<IExtensionBundleManager>(MockBehavior.Strict);
 
             _hostController = new HostController(optionsWrapper, hostOptions, loggerFactory, mockAuthorizationService.Object, mockWebFunctionsManager.Object, _mockEnvironment.Object, _mockScriptHostManager.Object, _functionsSyncManager.Object);
 
@@ -94,43 +102,32 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Fact]
-        public void GetAdminToken_Succeeds()
+        public async Task GetScaleStatus_RuntimeScaleModeEnabled_Succeeds()
         {
-            // Arrange
-            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.Is<string>(k => k == EnvironmentSettingNames.ContainerName))).Returns<string>(v => v = "ContainerName");
+            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(EnvironmentSettingNames.FunctionsRuntimeScaleMonitoringEnabled)).Returns("1");
 
-            var key = TestHelpers.GenerateKeyBytes();
-            var stringKey = TestHelpers.GenerateKeyHexString(key);
-            using (new TestScopedEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, stringKey))
+            var context = new ScaleStatusContext
             {
-                // Act
-                ObjectResult result = (ObjectResult)_hostController.GetAdminToken();
-                HttpStatusCode resultStatus = (HttpStatusCode)result.StatusCode;
-                string token = (string)result.Value;
-
-                // Assert
-                Assert.Equal(HttpStatusCode.OK, resultStatus);
-                Assert.True(SimpleWebTokenHelper.ValidateToken(token, new SystemClock()));
-            }
+                WorkerCount = 5
+            };
+            var scaleManagerMock = new Mock<FunctionsScaleManager>(MockBehavior.Strict);
+            var scaleStatusResult = new ScaleStatusResult { Vote = ScaleVote.ScaleOut };
+            scaleManagerMock.Setup(p => p.GetScaleStatusAsync(context)).ReturnsAsync(scaleStatusResult);
+            var result = (ObjectResult)(await _hostController.GetScaleStatus(context, scaleManagerMock.Object));
+            Assert.Same(result.Value, scaleStatusResult);
         }
 
         [Fact]
-        public void GetAdminToken_Fails_NotLinuxContainer()
+        public async Task GetScaleStatus_RuntimeScaleModeNotEnabled_ReturnsBadRequest()
         {
-            // Arrange
-            _mockEnvironment.Setup(p => p.GetEnvironmentVariable(It.Is<string>(k => k == EnvironmentSettingNames.ContainerName))).Returns<string>(v => v = null);
-
-            var key = TestHelpers.GenerateKeyBytes();
-            var stringKey = TestHelpers.GenerateKeyHexString(key);
-            using (new TestScopedEnvironmentVariable(EnvironmentSettingNames.WebSiteAuthEncryptionKey, stringKey))
+            var context = new ScaleStatusContext
             {
-                // Act
-                ObjectResult result = (ObjectResult)_hostController.GetAdminToken();
-                HttpStatusCode resultStatus = (HttpStatusCode)result.StatusCode;
-
-                // Assert
-                Assert.Equal(HttpStatusCode.BadRequest, resultStatus);
-            }
+                WorkerCount = 5
+            };
+            var scaleManagerMock = new Mock<FunctionsScaleManager>(MockBehavior.Strict);
+            var result = (BadRequestObjectResult)(await _hostController.GetScaleStatus(context, scaleManagerMock.Object));
+            Assert.Equal(HttpStatusCode.BadRequest, (HttpStatusCode)result.StatusCode);
+            Assert.Equal("Runtime scale monitoring is not enabled.", result.Value);
         }
     }
 }

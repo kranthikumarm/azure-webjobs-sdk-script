@@ -11,6 +11,8 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 {
     public class FunctionMetadata
     {
+        private bool? _isHttpInOut = null;
+
         public FunctionMetadata()
         {
             Bindings = new Collection<BindingMetadata>();
@@ -59,6 +61,34 @@ namespace Microsoft.Azure.WebJobs.Script.Description
 
         public Collection<BindingMetadata> Bindings { get; }
 
+        public bool IsHttpInAndOutFunction
+        {
+            get
+            {
+                if (_isHttpInOut == null)
+                {
+                    if (InputBindings.Count() != 1 || OutputBindings.Count() != 1)
+                    {
+                        _isHttpInOut = false;
+                        return false;
+                    }
+
+                    BindingMetadata inputBindingMetadata = InputBindings.ElementAt(0);
+                    BindingMetadata outputBindingMetadata = OutputBindings.ElementAt(0);
+                    if (string.Equals("httptrigger", inputBindingMetadata.Type, StringComparison.OrdinalIgnoreCase) &&
+                        string.Equals("http", outputBindingMetadata.Type, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _isHttpInOut = true;
+                        return true;
+                    }
+                    _isHttpInOut = false;
+                    return false;
+                }
+
+                return _isHttpInOut.Value;
+            }
+        }
+
         public IEnumerable<BindingMetadata> InputBindings
         {
             get
@@ -73,6 +103,11 @@ namespace Microsoft.Azure.WebJobs.Script.Description
             {
                 return Bindings.Where(p => p.Direction != BindingDirection.In);
             }
+        }
+
+        public BindingMetadata Trigger
+        {
+            get { return InputBindings.FirstOrDefault(binding => binding.IsTrigger); }
         }
     }
 }

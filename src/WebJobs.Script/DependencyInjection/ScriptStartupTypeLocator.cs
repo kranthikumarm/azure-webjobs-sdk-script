@@ -8,13 +8,11 @@ using System.Linq;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Hosting;
 using Microsoft.Azure.WebJobs.Script.Description;
+using Microsoft.Azure.WebJobs.Script.Diagnostics;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
 using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.Models;
-using Microsoft.Azure.WebJobs.Script.Properties;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 
@@ -29,14 +27,18 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
         private readonly string _rootScriptPath;
         private readonly ILogger _logger;
         private readonly IExtensionBundleManager _extensionBundleManager;
+        private readonly IFunctionMetadataProvider _functionMetadataProvider;
+        private readonly IMetricsLogger _metricsLogger;
 
         private static string[] _builtinExtensionAssemblies = GetBuiltinExtensionAssemblies();
 
-        public ScriptStartupTypeLocator(string rootScriptPath, ILogger<ScriptStartupTypeLocator> logger, IExtensionBundleManager extensionBundleManager)
+        public ScriptStartupTypeLocator(string rootScriptPath, ILogger<ScriptStartupTypeLocator> logger, IExtensionBundleManager extensionBundleManager, IFunctionMetadataProvider functionMetadataProvider, IMetricsLogger metricsLogger)
         {
             _rootScriptPath = rootScriptPath ?? throw new ArgumentNullException(nameof(rootScriptPath));
             _extensionBundleManager = extensionBundleManager ?? throw new ArgumentNullException(nameof(extensionBundleManager));
             _logger = logger;
+            _functionMetadataProvider = functionMetadataProvider;
+            _metricsLogger = metricsLogger;
         }
 
         private static string[] GetBuiltinExtensionAssemblies()
@@ -60,13 +62,34 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
         public async Task<IEnumerable<Type>> GetExtensionsStartupTypesAsync()
         {
             string binPath;
-            if (_extensionBundleManager.IsExtensionBundleConfigured())
+            var functionMetadataCollection = _functionMetadataProvider.GetFunctionMetadata(forceRefresh: true);
+            HashSet<string> bindingsSet = null;
+            var bundleConfigured = _extensionBundleManager.IsExtensionBundleConfigured();
+            bool isPrecompiledFunctionApp = false;
+
+            if (bundleConfigured)
+            {
+                bindingsSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                // Generate a Hashset of all the binding types used in the function app
+                foreach (var functionMetadata in functionMetadataCollection)
+                {
+                    foreach (var binding in functionMetadata.Bindings)
+                    {
+                        bindingsSet.Add(binding.Type);
+                    }
+                    isPrecompiledFunctionApp = isPrecompiledFunctionApp || functionMetadata.Language == DotNetScriptTypes.DotNetAssembly;
+                }
+            }
+
+            bool isLegacyExtensionBundle = _extensionBundleManager.IsLegacyExtensionBundle();
+            if (bundleConfigured && (!isPrecompiledFunctionApp || _extensionBundleManager.IsLegacyExtensionBundle()))
             {
                 string extensionBundlePath = await _extensionBundleManager.GetExtensionBundlePath();
                 if (string.IsNullOrEmpty(extensionBundlePath))
                 {
                     _logger.ScriptStartUpErrorLoadingExtensionBundle();
-                    return null;
+                    return new Type[0];
                 }
                 _logger.ScriptStartUpLoadingExtensionBundle(extensionBundlePath);
                 binPath = Path.Combine(extensionBundlePath, "bin");
@@ -74,6 +97,7 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
             else
             {
                 binPath = Path.Combine(_rootScriptPath, "bin");
+                _logger.ScriptStartNotLoadingExtensionBundle(binPath, bundleConfigured, isPrecompiledFunctionApp, isLegacyExtensionBundle);
             }
 
             string metadataFilePath = Path.Combine(binPath, ScriptConstants.ExtensionsMetadataFileName);
@@ -83,58 +107,61 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
 
             var startupTypes = new List<Type>();
 
-            foreach (var item in extensionItems)
+            foreach (var extensionItem in extensionItems)
             {
-                string startupExtensionName = item.Name ?? item.TypeName;
-                _logger.ScriptStartUpLoadingStartUpExtension(startupExtensionName);
+                if (!bundleConfigured
+                    || extensionItem.Bindings.Count == 0
+                    || extensionItem.Bindings.Intersect(bindingsSet, StringComparer.OrdinalIgnoreCase).Any())
+                {
+                    string startupExtensionName = extensionItem.Name ?? extensionItem.TypeName;
+                    _logger.ScriptStartUpLoadingStartUpExtension(startupExtensionName);
 
-                // load the Type for each startup extension into the function assembly load context
-                Type extensionType = Type.GetType(item.TypeName,
-                    assemblyName =>
-                    {
-                        if (_builtinExtensionAssemblies.Contains(assemblyName.Name, StringComparer.OrdinalIgnoreCase))
+                    // load the Type for each startup extension into the function assembly load context
+                    Type extensionType = Type.GetType(extensionItem.TypeName,
+                        assemblyName =>
                         {
-                            _logger.ScriptStartUpBelongExtension(item.TypeName);
+                            if (_builtinExtensionAssemblies.Contains(assemblyName.Name, StringComparer.OrdinalIgnoreCase))
+                            {
+                                _logger.ScriptStartUpBelongExtension(extensionItem.TypeName);
+                                return null;
+                            }
+
+                            string path = extensionItem.HintPath;
+                            if (string.IsNullOrEmpty(path))
+                            {
+                                path = assemblyName.Name + ".dll";
+                            }
+
+                            var hintUri = new Uri(path, UriKind.RelativeOrAbsolute);
+                            if (!hintUri.IsAbsoluteUri)
+                            {
+                                path = Path.Combine(binPath, path);
+                            }
+
+                            if (File.Exists(path))
+                            {
+                                return FunctionAssemblyLoadContext.Shared.LoadFromAssemblyPath(path, true);
+                            }
+
                             return null;
-                        }
-
-                        string path = item.HintPath;
-                        if (string.IsNullOrEmpty(path))
+                        },
+                        (assembly, typeName, ignoreCase) =>
                         {
-                            path = assemblyName.Name + ".dll";
-                        }
-
-                        var hintUri = new Uri(path, UriKind.RelativeOrAbsolute);
-                        if (!hintUri.IsAbsoluteUri)
-                        {
-                            path = Path.Combine(binPath, path);
-                        }
-
-                        if (File.Exists(path))
-                        {
-                            return FunctionAssemblyLoadContext.Shared.LoadFromAssemblyPath(path, true);
-                        }
-
-                        return null;
-                    },
-                    (assembly, typeName, ignoreCase) =>
+                            _logger.ScriptStartUpLoadedExtension(startupExtensionName, assembly.GetName().Version.ToString());
+                            return assembly?.GetType(typeName, false, ignoreCase);
+                        }, false, true);
+                    if (extensionType == null)
                     {
-                        _logger.ScriptStartUpLoadedExtension(startupExtensionName, assembly.GetName().Version.ToString());
-                        return assembly?.GetType(typeName, false, ignoreCase);
-                    }, false, true);
-
-                if (extensionType == null)
-                {
-                    _logger.ScriptStartUpUnableToLoadExtension(startupExtensionName, item.TypeName);
-                    continue;
+                        _logger.ScriptStartUpUnableToLoadExtension(startupExtensionName, extensionItem.TypeName);
+                        continue;
+                    }
+                    if (!typeof(IWebJobsStartup).IsAssignableFrom(extensionType))
+                    {
+                        _logger.ScriptStartUpTypeIsNotValid(extensionItem.TypeName, nameof(IWebJobsStartup));
+                        continue;
+                    }
+                    startupTypes.Add(extensionType);
                 }
-                if (!typeof(IWebJobsStartup).IsAssignableFrom(extensionType))
-                {
-                    _logger.ScriptStartUpTypeIsNotValid(item.TypeName, nameof(IWebJobsStartup));
-                    continue;
-                }
-
-                startupTypes.Add(extensionType);
             }
 
             return startupTypes;
@@ -142,29 +169,32 @@ namespace Microsoft.Azure.WebJobs.Script.DependencyInjection
 
         private ExtensionReference[] ParseExtensions(string metadataFilePath)
         {
-            if (!File.Exists(metadataFilePath))
+            using (_metricsLogger.LatencyEvent(MetricEventNames.ParseExtensions))
             {
-                return Array.Empty<ExtensionReference>();
-            }
-
-            try
-            {
-                var extensionMetadata = JObject.Parse(File.ReadAllText(metadataFilePath));
-
-                var extensionItems = extensionMetadata["extensions"]?.ToObject<List<ExtensionReference>>();
-                if (extensionItems == null)
+                if (!File.Exists(metadataFilePath))
                 {
-                    _logger.ScriptStartUpUnableParseMetadataMissingProperty(metadataFilePath);
                     return Array.Empty<ExtensionReference>();
                 }
 
-                return extensionItems.ToArray();
-            }
-            catch (JsonReaderException exc)
-            {
-                _logger.ScriptStartUpUnableParseMetadata(exc, metadataFilePath);
+                try
+                {
+                    var extensionMetadata = JObject.Parse(File.ReadAllText(metadataFilePath));
 
-                return Array.Empty<ExtensionReference>();
+                    var extensionItems = extensionMetadata["extensions"]?.ToObject<List<ExtensionReference>>();
+                    if (extensionItems == null)
+                    {
+                        _logger.ScriptStartUpUnableParseMetadataMissingProperty(metadataFilePath);
+                        return Array.Empty<ExtensionReference>();
+                    }
+
+                    return extensionItems.ToArray();
+                }
+                catch (JsonReaderException exc)
+                {
+                    _logger.ScriptStartUpUnableParseMetadata(exc, metadataFilePath);
+
+                    return Array.Empty<ExtensionReference>();
+                }
             }
         }
 

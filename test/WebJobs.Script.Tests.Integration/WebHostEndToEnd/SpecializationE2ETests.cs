@@ -16,8 +16,9 @@ using Microsoft.AspNetCore.TestHost;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Logging.ApplicationInsights;
 using Microsoft.Azure.WebJobs.Script.Configuration;
-using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.Azure.WebJobs.Script.WebHost;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -25,6 +26,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Microsoft.WebJobs.Script.Tests;
 using Xunit;
+using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests
 {
@@ -174,8 +176,9 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
                 // Before the fix, when we issued the 100 requests, they would all enter the ThreadPool queue and
                 // a new thread would be taken from the thread pool every 500ms, resulting in thread starvation.
-                // After the fix, we should only be losing one.
-                int precision = 1;
+                // After the fix, we should only be losing one (but other operations may also be using a thread, so 
+                // we'll leave a little wiggle-room).
+                int precision = 3;
                 Assert.True(workerThreads >= originalWorkerThreads - precision, $"Available ThreadPool threads should not have decreased by more than {precision}. Actual: {workerThreads}. Original: {originalWorkerThreads}.");
 
                 await Task.WhenAll(requestTasks);
@@ -184,6 +187,34 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 var validateStatusCodes = Enumerable.Repeat<Action<HttpStatusCode>>(ValidateStatusCode, 100).ToArray();
                 var actualStatusCodes = requestTasks.Select(t => t.Result.StatusCode);
                 Assert.Collection(actualStatusCodes, validateStatusCodes);
+            }
+        }
+
+        [Fact]
+        public async Task Specialization_ResetsSharedLoadContext()
+        {
+            var builder = CreateStandbyHostBuilder("FunctionExecutionContext");
+
+            using (var testServer = new TestServer(builder))
+            {
+                var client = testServer.CreateClient();
+
+                var response = await client.GetAsync("api/warmup");
+                response.EnsureSuccessStatusCode();
+
+                var placeholderContext = FunctionAssemblyLoadContext.Shared;
+
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsiteContainerReady, "1");
+                _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "0");
+
+                //await _pauseBeforeHostBuild.WaitAsync(10000);
+
+                response = await client.GetAsync("api/functionexecutioncontext");
+                response.EnsureSuccessStatusCode();
+
+                var specializedContext = FunctionAssemblyLoadContext.Shared;
+
+                Assert.NotSame(placeholderContext, specializedContext);
             }
         }
 
@@ -245,7 +276,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     // request for triggering specialization.
                     s.AddSingleton<IStandbyManager, InfiniteTimerStandbyManager>();
 
-                    s.AddSingleton<IScriptHostBuilder, PausingScriptHostBuilder>();
+                    s.AddSingleton<IScriptHostBuilder, PausingScriptHostBuilder>(); 
                 })
                 .ConfigureScriptHostServices(s =>
                 {
@@ -264,11 +295,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
 
         private class InfiniteTimerStandbyManager : StandbyManager
         {
-            public InfiniteTimerStandbyManager(IScriptHostManager scriptHostManager, IWebHostLanguageWorkerChannelManager languageWorkerChannelManager,
+            public InfiniteTimerStandbyManager(IScriptHostManager scriptHostManager, IWebHostRpcWorkerChannelManager rpcWorkerChannelManager,
                 IConfiguration configuration, IScriptWebHostEnvironment webHostEnvironment, IEnvironment environment,
-                IOptionsMonitor<ScriptApplicationHostOptions> options, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider)
-                : base(scriptHostManager, languageWorkerChannelManager, configuration, webHostEnvironment, environment, options,
-                      logger, hostNameProvider, TimeSpan.FromMilliseconds(-1))
+                IOptionsMonitor<ScriptApplicationHostOptions> options, ILogger<StandbyManager> logger, HostNameProvider hostNameProvider, IApplicationLifetime applicationLifetime)
+                : base(scriptHostManager, rpcWorkerChannelManager, configuration, webHostEnvironment, environment, options,
+                      logger, hostNameProvider, applicationLifetime, TimeSpan.FromMilliseconds(-1), new TestMetricsLogger())
             {
             }
         }

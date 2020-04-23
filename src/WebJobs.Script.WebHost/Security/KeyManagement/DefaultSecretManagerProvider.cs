@@ -15,18 +15,18 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
     public sealed class DefaultSecretManagerProvider : ISecretManagerProvider
     {
         private const string FileStorage = "Files";
-        private const string BlobStorage = "Blob";
-        private readonly ILogger _logger;
+        private readonly ILoggerFactory _loggerFactory;
         private readonly IMetricsLogger _metricsLogger;
         private readonly IOptionsMonitor<ScriptApplicationHostOptions> _options;
         private readonly IHostIdProvider _hostIdProvider;
         private readonly IConfiguration _configuration;
         private readonly IEnvironment _environment;
         private readonly HostNameProvider _hostNameProvider;
+        private readonly StartupContextProvider _startupContextProvider;
         private Lazy<ISecretManager> _secretManagerLazy;
 
         public DefaultSecretManagerProvider(IOptionsMonitor<ScriptApplicationHostOptions> options, IHostIdProvider hostIdProvider,
-            IConfiguration configuration, IEnvironment environment, ILoggerFactory loggerFactory, IMetricsLogger metricsLogger, HostNameProvider hostNameProvider)
+            IConfiguration configuration, IEnvironment environment, ILoggerFactory loggerFactory, IMetricsLogger metricsLogger, HostNameProvider hostNameProvider, StartupContextProvider startupContextProvider)
         {
             if (loggerFactory == null)
             {
@@ -38,8 +38,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
             _environment = environment ?? throw new ArgumentNullException(nameof(environment));
             _hostNameProvider = hostNameProvider ?? throw new ArgumentNullException(nameof(hostNameProvider));
+            _startupContextProvider = startupContextProvider ?? throw new ArgumentNullException(nameof(startupContextProvider));
 
-            _logger = loggerFactory.CreateLogger(ScriptConstants.LogCategoryHostGeneral);
+            _loggerFactory = loggerFactory;
             _metricsLogger = metricsLogger ?? throw new ArgumentNullException(nameof(metricsLogger));
             _secretManagerLazy = new Lazy<ISecretManager>(Create);
 
@@ -51,7 +52,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         private void ResetSecretManager() => Interlocked.Exchange(ref _secretManagerLazy, new Lazy<ISecretManager>(Create));
 
-        private ISecretManager Create() => new SecretManager(CreateSecretsRepository(), _logger, _metricsLogger, _hostNameProvider);
+        private ISecretManager Create() => new SecretManager(CreateSecretsRepository(), _loggerFactory.CreateLogger<SecretManager>(), _metricsLogger, _hostNameProvider, _startupContextProvider);
 
         internal ISecretsRepository CreateSecretsRepository()
         {
@@ -60,13 +61,14 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             string secretStorageSas = _environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsSecretStorageSas);
             if (secretStorageType != null && secretStorageType.Equals(FileStorage, StringComparison.OrdinalIgnoreCase))
             {
-                return new FileSystemSecretsRepository(_options.CurrentValue.SecretsPath);
+                return new FileSystemSecretsRepository(_options.CurrentValue.SecretsPath, _loggerFactory.CreateLogger<FileSystemSecretsRepository>(), _environment);
             }
             else if (secretStorageType != null && secretStorageType.Equals("keyvault", StringComparison.OrdinalIgnoreCase))
             {
                 string azureWebJobsSecretStorageKeyVaultName = Environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsSecretStorageKeyVaultName);
                 string azureWebJobsSecretStorageKeyVaultConnectionString = Environment.GetEnvironmentVariable(EnvironmentSettingNames.AzureWebJobsSecretStorageKeyVaultConnectionString);
-                return new KeyVaultSecretsRepository(Path.Combine(_options.CurrentValue.SecretsPath, "Sentinels"), azureWebJobsSecretStorageKeyVaultName, azureWebJobsSecretStorageKeyVaultConnectionString);
+                var logger = _loggerFactory.CreateLogger<KeyVaultSecretsRepository>();
+                return new KeyVaultSecretsRepository(Path.Combine(_options.CurrentValue.SecretsPath, "Sentinels"), azureWebJobsSecretStorageKeyVaultName, azureWebJobsSecretStorageKeyVaultConnectionString, logger, _environment);
             }
             else if (secretStorageType != null && secretStorageType.Equals("kubernetes", StringComparison.OrdinalIgnoreCase))
             {
@@ -75,12 +77,12 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             else if (secretStorageSas != null)
             {
                 string siteSlotName = _environment.GetAzureWebsiteUniqueSlotName() ?? _hostIdProvider.GetHostIdAsync(CancellationToken.None).GetAwaiter().GetResult();
-                return new BlobStorageSasSecretsRepository(Path.Combine(_options.CurrentValue.SecretsPath, "Sentinels"), secretStorageSas, siteSlotName);
+                return new BlobStorageSasSecretsRepository(Path.Combine(_options.CurrentValue.SecretsPath, "Sentinels"), secretStorageSas, siteSlotName, _loggerFactory.CreateLogger<BlobStorageSasSecretsRepository>(), _environment);
             }
             else if (storageString != null)
             {
                 string siteSlotName = _environment.GetAzureWebsiteUniqueSlotName() ?? _hostIdProvider.GetHostIdAsync(CancellationToken.None).GetAwaiter().GetResult();
-                return new BlobStorageSecretsRepository(Path.Combine(_options.CurrentValue.SecretsPath, "Sentinels"), storageString, siteSlotName);
+                return new BlobStorageSecretsRepository(Path.Combine(_options.CurrentValue.SecretsPath, "Sentinels"), storageString, siteSlotName, _loggerFactory.CreateLogger<BlobStorageSecretsRepository>(), _environment);
             }
             else
             {

@@ -11,6 +11,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 {
     internal class LinuxContainerEventGenerator : LinuxEventGenerator
     {
+        private const int MaxDetailsLength = 10000;
         private readonly Action<string> _writeEvent;
         private readonly bool _consoleEnabled = true;
         private readonly IEnvironment _environment;
@@ -37,6 +38,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         public static string DetailsEventRegex { get; } = $"{ScriptConstants.LinuxFunctionDetailsEventStreamName} (?<AppName>[^,]*),(?<FunctionName>[^,]*),\\\\\"(?<InputBindings>.*)\\\\\",\\\\\"(?<OutputBindings>.*)\\\\\",(?<ScriptType>[^,]*),(?<IsDisabled>[0|1])";
 
+        public static string AzureMonitorEventRegex { get; } = $"{ScriptConstants.LinuxAzureMonitorEventStreamName} (?<Level>[0-6]),(?<ResourceId>[^,]*),(?<OperationName>[^,]*),(?<Category>[^,]*),(?<RegionName>[^,]*),\"(?<Properties>[^,]*)\",(?<ContainerName>[^,\"]*),(?<TenantId>[^,\"]*),(?<EventTimestamp>[^,]+)";
+
         private string StampName
         {
             get
@@ -61,16 +64,17 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             }
         }
 
-        public override void LogFunctionTraceEvent(LogLevel level, string subscriptionId, string appName, string functionName, string eventName, string source, string details, string summary, string exceptionType, string exceptionMessage, string functionInvocationId, string hostInstanceId, string activityId)
+        public override void LogFunctionTraceEvent(LogLevel level, string subscriptionId, string appName, string functionName, string eventName, string source, string details, string summary, string exceptionType, string exceptionMessage, string functionInvocationId, string hostInstanceId, string activityId, string runtimeSiteName, string slotName)
         {
             string eventTimestamp = DateTime.UtcNow.ToString(EventTimestampFormat);
             string hostVersion = ScriptHost.Version;
             FunctionsSystemLogsEventSource.Instance.SetActivityId(activityId);
+            details = details.Length > MaxDetailsLength ? details.Substring(0, MaxDetailsLength) : details;
 
             _writeEvent($"{ScriptConstants.LinuxLogEventStreamName} {(int)ToEventLevel(level)},{subscriptionId},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{eventTimestamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId},{_containerName},{StampName},{TenantId}");
         }
 
-        public override void LogFunctionMetricEvent(string subscriptionId, string appName, string functionName, string eventName, long average, long minimum, long maximum, long count, DateTime eventTimestamp, string data)
+        public override void LogFunctionMetricEvent(string subscriptionId, string appName, string functionName, string eventName, long average, long minimum, long maximum, long count, DateTime eventTimestamp, string data, string runtimeSiteName, string slotName)
         {
             string hostVersion = ScriptHost.Version;
 
@@ -100,6 +104,19 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         public override void LogAzureMonitorDiagnosticLogEvent(LogLevel level, string resourceId, string operationName, string category, string regionName, string properties)
         {
+            _writeEvent($"{ScriptConstants.LinuxAzureMonitorEventStreamName} {(int)ToEventLevel(level)},{resourceId},{operationName},{category},{regionName},{NormalizeString(properties.Replace("'", string.Empty))},{_containerName},{TenantId},{DateTime.UtcNow.ToString()}");
+        }
+
+        public static void LogUnhandledException(Exception e)
+        {
+            var linuxContainerEventGenerator = new LinuxContainerEventGenerator(SystemEnvironment.Instance);
+            linuxContainerEventGenerator.LogFunctionTraceEvent(LogLevel.Error,
+                SystemEnvironment.Instance.GetSubscriptionId() ?? string.Empty,
+                SystemEnvironment.Instance.GetAzureWebsiteUniqueSlotName() ?? string.Empty, string.Empty, string.Empty,
+                nameof(LogUnhandledException), e?.ToString(), string.Empty, e?.GetType().ToString() ?? string.Empty,
+                e?.ToString(), string.Empty, string.Empty, string.Empty,
+                SystemEnvironment.Instance.GetRuntimeSiteName() ?? string.Empty,
+                SystemEnvironment.Instance.GetSlotName() ?? string.Empty);
         }
     }
 }

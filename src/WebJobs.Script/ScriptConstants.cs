@@ -2,6 +2,7 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System.Collections.Immutable;
+using NuGet.Versioning;
 
 namespace Microsoft.Azure.WebJobs.Script
 {
@@ -21,6 +22,9 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string AzureFunctionsDuplicateHttpHeadersKey = "MS_AzureFunctionsDuplicateHttpHeaders";
         public const string JobHostMiddlewarePipelineRequestDelegate = "MS_JobHostMiddlewarePipelineRequestDelegate";
         public const string HstsMiddlewareRequestDelegate = "MS_HstsMiddlewareRequestDelegate";
+        public const string CorsMiddlewareRequestDelegate = "MS_CorsMiddlewareRequestDelegate";
+
+        public const string LegacyPlaceholderTemplateSiteName = "FunctionsPlaceholderTemplateSite";
 
         public const string LogPropertyPrimaryHostKey = "MS_PrimaryHost";
         public const string LogPropertySourceKey = "MS_Source";
@@ -71,6 +75,8 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string ProxyMetadataFileName = "proxies.json";
         public const string ExtensionsMetadataFileName = "extensions.json";
         public const string AppOfflineFileName = "app_offline.htm";
+        public const string RunFromPackageFailedFileName = "FAILED TO INITIALIZE RUN FROM PACKAGE.txt";
+        public const string DisableContainerFileName = "container_offline";
         public const string ResourcePath = "Microsoft.Azure.WebJobs.Script.WebHost.Resources";
 
         public const string DefaultMasterKeyName = "master";
@@ -79,11 +85,15 @@ namespace Microsoft.Azure.WebJobs.Script
 
         public const string FunctionsUserAgent = "AzureFunctionsRuntime";
         public const string AntaresDefaultHostNameHeader = "WAS-DEFAULT-HOSTNAME";
+        public const string AntaresARMRequestTrackingIdHeader = "x-ms-arm-request-tracking-id";
+        public const string AntaresARMExtensionsRouteHeader = "X-MS-VIA-EXTENSIONS-ROUTE";
+        public const string AntaresClientAuthorizationSourceHeader = "X-MS-CLIENT-AUTHORIZATION-SOURCE";
         public const string AntaresLogIdHeaderName = "X-ARR-LOG-ID";
         public const string AntaresScaleOutHeaderName = "X-FUNCTION-SCALEOUT";
         public const string AntaresColdStartHeaderName = "X-MS-COLDSTART";
         public const string SiteTokenHeaderName = "x-ms-site-restricted-token";
         public const string DynamicSku = "Dynamic";
+        public const string ElasticPremiumSku = "ElasticPremium";
         public const string DefaultProductionSlotName = "production";
 
         public const string AzureProxyFunctionLocalRedirectKey = "MS_ProxyLocalRedirectCount";
@@ -111,7 +121,7 @@ namespace Microsoft.Azure.WebJobs.Script
         /// This constant is also defined in Antares, where the limit is ultimately enforced
         /// for settriggers calls. If we raise that limit there, we should raise here as well.
         /// </summary>
-        public const int MaxTriggersStringLength = 102400;
+        public const int MaxTriggersStringLength = 204800;
 
         public const string ExtensionsProjectFileName = "extensions.csproj";
         public const string MetadataGeneratorPackageId = "Microsoft.Azure.WebJobs.Script.ExtensionsMetadataGenerator";
@@ -125,6 +135,7 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string LinuxLogEventStreamName = "MS_FUNCTION_LOGS";
         public const string LinuxMetricEventStreamName = "MS_FUNCTION_METRICS";
         public const string LinuxFunctionDetailsEventStreamName = "MS_FUNCTION_DETAILS";
+        public const string LinuxAzureMonitorEventStreamName = "MS_FUNCTION_AZURE_MONITOR_EVENT";
         public const string LinuxMSISpecializationStem = "/api/specialize?api-version=2017-09-01";
 
         public const string DurableTaskPropertyName = "durableTask";
@@ -140,9 +151,11 @@ namespace Microsoft.Azure.WebJobs.Script
         public const string ExtensionBundleBindingMetadataFile = "bindings.json";
         public const string ExtensionBundleTemplatesFile = "templates.json";
         public const string ExtensionBundleResourcesFile = "Resources.json";
+        public const string DefaultExtensionBundleId = "Microsoft.Azure.Functions.ExtensionBundle";
 
         public static readonly ImmutableArray<string> HttpMethods = ImmutableArray.Create("get", "post", "delete", "head", "patch", "put", "options");
         public static readonly ImmutableArray<string> AssemblyFileTypes = ImmutableArray.Create(".dll", ".exe");
         public static readonly string HostUserAgent = $"azure-functions-host/{ScriptHost.Version}";
+        public static readonly NuGetVersion ExtensionBundleVersionTwo = new NuGetVersion("2.0.0");
     }
 }

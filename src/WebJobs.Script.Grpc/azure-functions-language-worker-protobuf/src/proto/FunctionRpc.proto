@@ -189,6 +189,8 @@ message WorkerStatusResponse {
 message FunctionEnvironmentReloadRequest {
   // Environment variables from the current process
   map<string, string> environment_variables = 1;
+  // Current directory of function app
+  string function_app_directory = 2;
 }
 
 message FunctionEnvironmentReloadResponse {
@@ -255,6 +257,21 @@ message InvocationRequest {
 
   // binding metadata from trigger
   map<string, TypedData> trigger_metadata = 4;
+
+  // Populates activityId, tracestate and tags from host
+  RpcTraceContext trace_context = 5;
+}
+
+// Host sends ActivityId, traceStateString and Tags from host
+message RpcTraceContext {
+	// This corresponds to Activity.Current?.Id
+	string trace_parent = 1;
+
+	// This corresponds to Activity.Current?.TraceStateString
+	string trace_state = 2;
+
+	// This corresponds to Activity.Current?.Tags
+	map<string, string> attributes = 3;
 }
 
 // Host requests worker to cancel invocation
@@ -368,6 +385,12 @@ message RpcLog {
     None = 6;
   }
 
+  // Category of the log. Defaults to User if not specified.
+  enum RpcLogCategory {
+	User = 0;
+	System = 1;
+  }
+
   // Unique id for invocation (if exists)
   string invocation_id = 1;
 
@@ -389,6 +412,9 @@ message RpcLog {
 
   // json serialized property bag, or could use a type scheme like map<string, TypedData>
   string properties = 7;
+
+  // Category of the log. Either user(default) or system.
+  RpcLogCategory log_category = 8;
 }
 
 // Encapsulates an Exception 
@@ -399,17 +425,18 @@ message RpcException {
   // Stack trace for the exception
   string stack_trace = 1;
 
-  // Textual message describing hte exception
+  // Textual message describing the exception
   string message = 2;
 }
 
 // Http cookie type. Note that only name and value are used for Http requests
 message RpcHttpCookie {
-  // Enum that lets servers require that a cookie shouoldn't be sent with cross-site requests
+  // Enum that lets servers require that a cookie shouldn't be sent with cross-site requests
   enum SameSite {
       None = 0;
       Lax = 1;
       Strict = 2;
+      ExplicitNone = 3;
   }
 
   // Cookie name

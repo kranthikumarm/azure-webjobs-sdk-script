@@ -2,8 +2,12 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
+using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
+using Microsoft.Azure.WebJobs.Script.WebHost.ContainerManagement;
 using Microsoft.Azure.WebJobs.Script.WebHost.Metrics;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 {
@@ -12,8 +16,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
         private readonly MetricsEventManager _metricsEventManager;
         private bool disposed = false;
 
-        public WebHostMetricsLogger(IEnvironment environment, IEventGenerator eventGenerator, IMetricsPublisher metricsPublisher)
-            : this(environment, eventGenerator, metricsPublisher, 5)
+        public WebHostMetricsLogger(IOptionsMonitor<AppServiceOptions> appServiceOptions, IEventGenerator eventGenerator, IMetricsPublisher metricsPublisher, ILinuxContainerActivityPublisher linuxContainerActivityPublisher, ILoggerFactory loggerFactory)
+            : this(appServiceOptions, eventGenerator, metricsPublisher, linuxContainerActivityPublisher, 5, loggerFactory)
         {
         }
 
@@ -22,9 +26,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
             _metricsEventManager = eventManager;
         }
 
-        protected WebHostMetricsLogger(IEnvironment environment, IEventGenerator eventGenerator, IMetricsPublisher metricsPublisher, int metricEventIntervalInSeconds)
+        protected WebHostMetricsLogger(IOptionsMonitor<AppServiceOptions> appServiceOptions, IEventGenerator eventGenerator, IMetricsPublisher metricsPublisher, ILinuxContainerActivityPublisher linuxContainerActivityPublisher, int metricEventIntervalInSeconds, ILoggerFactory loggerFactory)
         {
-            _metricsEventManager = new MetricsEventManager(environment, eventGenerator,  metricEventIntervalInSeconds, metricsPublisher);
+            _metricsEventManager = new MetricsEventManager(appServiceOptions, eventGenerator, metricEventIntervalInSeconds, metricsPublisher, linuxContainerActivityPublisher, loggerFactory.CreateLogger<MetricsEventManager>());
         }
 
         public object BeginEvent(string eventName, string functionName = null, string data = null)

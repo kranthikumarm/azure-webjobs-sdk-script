@@ -14,8 +14,9 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Description;
-using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
@@ -34,7 +35,49 @@ namespace Microsoft.Azure.WebJobs.Script
 
         private static readonly string UTF8ByteOrderMark = Encoding.UTF8.GetString(Encoding.UTF8.GetPreamble());
         private static readonly FilteredExpandoObjectConverter _filteredExpandoObjectConverter = new FilteredExpandoObjectConverter();
+        private static readonly string[] _allowedFunctionNameKeys = new[]
+        {
+            "functionName",
+            LogConstants.NameKey,
+            ScopeKeys.FunctionName
+        };
+
         private static List<string> dotNetLanguages = new List<string>() { DotNetScriptTypes.CSharp, DotNetScriptTypes.DotNetAssembly };
+
+        public static int ColdStartDelayMS { get; set; } = 5000;
+
+        /// <summary>
+        /// Walk from the method up to the containing type, looking for an instance
+        /// of the specified attribute type, returning it if found.
+        /// </summary>
+        /// <param name="method">The method to check.</param>
+        internal static T GetHierarchicalAttributeOrNull<T>(MethodInfo method) where T : Attribute
+        {
+            return (T)GetHierarchicalAttributeOrNull(method, typeof(T));
+        }
+
+        /// <summary>
+        /// Walk from the method up to the containing type, looking for an instance
+        /// of the specified attribute type, returning it if found.
+        /// </summary>
+        /// <param name="method">The method to check.</param>
+        /// <param name="type">The attribute type to look for.</param>
+        internal static Attribute GetHierarchicalAttributeOrNull(MethodInfo method, Type type)
+        {
+            var attribute = method.GetCustomAttribute(type);
+            if (attribute != null)
+            {
+                return attribute;
+            }
+
+            attribute = method.DeclaringType.GetCustomAttribute(type);
+            if (attribute != null)
+            {
+                return attribute;
+            }
+
+            return null;
+        }
 
         internal static async Task InvokeWithRetriesAsync(Action action, int maxRetries, TimeSpan retryInterval)
         {
@@ -73,17 +116,32 @@ namespace Microsoft.Azure.WebJobs.Script
         /// <param name="pollingIntervalMilliseconds">The polling interval.</param>
         /// <param name="condition">The condition to check</param>
         /// <returns>A Task representing the delay.</returns>
-        internal static async Task DelayAsync(int timeoutSeconds, int pollingIntervalMilliseconds, Func<bool> condition)
+        internal static Task<bool> DelayAsync(int timeoutSeconds, int pollingIntervalMilliseconds, Func<bool> condition)
+        {
+            Task<bool> Condition() => Task.FromResult(condition());
+            return DelayAsync(timeoutSeconds, pollingIntervalMilliseconds, Condition, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Delays while the specified condition remains true.
+        /// </summary>
+        /// <param name="timeoutSeconds">The maximum number of seconds to delay.</param>
+        /// <param name="pollingIntervalMilliseconds">The polling interval.</param>
+        /// <param name="condition">The async condition to check</param>
+        /// <returns>A Task representing the delay.</returns>
+        internal static async Task<bool> DelayAsync(int timeoutSeconds, int pollingIntervalMilliseconds, Func<Task<bool>> condition, CancellationToken cancellationToken)
         {
             TimeSpan timeout = TimeSpan.FromSeconds(timeoutSeconds);
             TimeSpan delay = TimeSpan.FromMilliseconds(pollingIntervalMilliseconds);
             TimeSpan timeWaited = TimeSpan.Zero;
-
-            while (condition() && (timeWaited < timeout))
+            bool conditionResult = await condition();
+            while (conditionResult && (timeWaited < timeout) && !cancellationToken.IsCancellationRequested)
             {
                 await Task.Delay(delay);
                 timeWaited += delay;
+                conditionResult = await condition();
             }
+            return conditionResult;
         }
 
         /// <summary>
@@ -101,7 +159,17 @@ namespace Microsoft.Azure.WebJobs.Script
         public static async Task DelayWithBackoffAsync(int exponent, CancellationToken cancellationToken, TimeSpan? unit = null,
             TimeSpan? min = null, TimeSpan? max = null, ILogger logger = null)
         {
-            TimeSpan delay = ComputeBackoff(exponent, unit, min, max);
+            TimeSpan delay = TimeSpan.FromSeconds(5);
+
+            try
+            {
+                delay = ComputeBackoff(exponent, unit, min, max);
+            }
+            catch (Exception ex)
+            {
+                logger?.LogDebug(ex, $"Exception while calculating backoff. Using a default '{delay}' delay.");
+            }
+
             logger?.LogDebug($"Delay is '{delay}'.");
 
             if (delay.TotalMilliseconds > 0)
@@ -119,12 +187,27 @@ namespace Microsoft.Azure.WebJobs.Script
 
         internal static TimeSpan ComputeBackoff(int exponent, TimeSpan? unit = null, TimeSpan? min = null, TimeSpan? max = null)
         {
+            TimeSpan maxValue = max ?? TimeSpan.MaxValue;
+
+            // prevent an OverflowException
+            if (exponent >= 64)
+            {
+                return maxValue;
+            }
+
             // determine the exponential backoff factor
             long backoffFactor = Convert.ToInt64((Math.Pow(2, exponent) - 1) / 2);
 
             // compute the backoff delay
             unit = unit ?? TimeSpan.FromSeconds(1);
             long totalDelayTicks = backoffFactor * unit.Value.Ticks;
+
+            // If we've overflowed long, return max.
+            if (backoffFactor > 0 && totalDelayTicks <= 0)
+            {
+                return maxValue;
+            }
+
             TimeSpan delay = TimeSpan.FromTicks(totalDelayTicks);
 
             // apply minimum restriction
@@ -134,9 +217,9 @@ namespace Microsoft.Azure.WebJobs.Script
             }
 
             // apply maximum restriction
-            if (max.HasValue && delay > max)
+            if (delay > maxValue)
             {
-                delay = max.Value;
+                delay = maxValue;
             }
 
             return delay;
@@ -170,6 +253,11 @@ namespace Microsoft.Azure.WebJobs.Script
         public static bool IsValidFunctionName(string functionName)
         {
             return FunctionNameValidationRegex.IsMatch(functionName);
+        }
+
+        public static bool FunctionNamesMatch(string functionName, string comparand)
+        {
+            return string.Equals(functionName, comparand, StringComparison.OrdinalIgnoreCase);
         }
 
         // "Namespace.Class.Method" --> "Namespace.Class"
@@ -392,14 +480,16 @@ namespace Microsoft.Azure.WebJobs.Script
             return (TValue)kvps.Last().Value;
         }
 
-        public static string GetValueFromState<TState>(TState state, string key)
+        public static string ResolveFunctionName(IEnumerable<KeyValuePair<string, object>> stateProps, IDictionary<string, object> scopeProps)
         {
-            string value = string.Empty;
-            if (state is IEnumerable<KeyValuePair<string, object>> stateDict)
-            {
-                value = GetStateValueOrDefault<string>(stateDict, key) ?? string.Empty;
-            }
-            return value;
+            // State wins, then scope. To find function name, we'll look for any of these values.
+            // "last" wins with state values, so reverse it.
+            var firstKvp = stateProps
+                .Reverse()
+                .Concat(scopeProps)
+                .FirstOrDefault(p => _allowedFunctionNameKeys.Contains(p.Key));
+
+            return firstKvp.Value?.ToString();
         }
 
         public static string GetValueFromScope(IDictionary<string, object> scopeProperties, string key)
@@ -449,13 +539,22 @@ namespace Microsoft.Azure.WebJobs.Script
             return true;
         }
 
-        internal static void VerifyFunctionsMatchSpecifiedLanguage(IEnumerable<FunctionMetadata> functions, string workerRuntime)
+        internal static void VerifyFunctionsMatchSpecifiedLanguage(IEnumerable<FunctionMetadata> functions, string workerRuntime, bool isPlaceholderMode, bool isHttpWorker)
         {
+            if (isPlaceholderMode)
+            {
+                return;
+            }
+            if (isHttpWorker)
+            {
+                // Do not enforce langauge for http worker
+                return;
+            }
             if (!IsSingleLanguage(functions, workerRuntime))
             {
                 if (string.IsNullOrEmpty(workerRuntime))
                 {
-                    throw new HostInitializationException($"Found functions with more than one language. Select a language for your function app by specifying {LanguageWorkerConstants.FunctionWorkerRuntimeSettingName} AppSetting");
+                    throw new HostInitializationException($"Found functions with more than one language. Select a language for your function app by specifying {RpcWorkerConstants.FunctionWorkerRuntimeSettingName} AppSetting");
                 }
                 else
                 {
@@ -488,13 +587,31 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 var functionsListWithoutProxies = functions?.Where(f => f.IsProxy == false);
                 string functionLanguage = functionsListWithoutProxies.FirstOrDefault()?.Language;
+                if (string.IsNullOrEmpty(functionLanguage))
+                {
+                    return null;
+                }
+
                 if (IsDotNetLanguageFunction(functionLanguage))
                 {
-                    return LanguageWorkerConstants.DotNetLanguageWorkerName;
+                    return RpcWorkerConstants.DotNetLanguageWorkerName;
                 }
                 return functionLanguage;
             }
             return null;
+        }
+
+        internal static bool IsFunctionMetadataLanguageSupportedByWorkerRuntime(FunctionMetadata functionMetadata, string workerRuntime)
+        {
+            if (string.IsNullOrEmpty(functionMetadata.Language))
+            {
+                return false;
+            }
+            if (string.IsNullOrEmpty(workerRuntime))
+            {
+                return true;
+            }
+            return !string.IsNullOrEmpty(functionMetadata.Language) && functionMetadata.Language.Equals(workerRuntime, StringComparison.OrdinalIgnoreCase);
         }
 
         public static bool IsDotNetLanguageFunction(string functionLanguage)
@@ -502,33 +619,92 @@ namespace Microsoft.Azure.WebJobs.Script
             return dotNetLanguages.Any(lang => string.Equals(lang, functionLanguage, StringComparison.OrdinalIgnoreCase));
         }
 
-        public static bool IsSupportedRuntime(string workerRuntime, IEnumerable<WorkerConfig> workerConfigs)
+        public static bool IsSupportedRuntime(string workerRuntime, IEnumerable<RpcWorkerConfig> workerConfigs)
         {
-            return workerConfigs.Any(config => string.Equals(config.Language, workerRuntime, StringComparison.OrdinalIgnoreCase));
+            return workerConfigs.Any(config => string.Equals(config.Description.Language, workerRuntime, StringComparison.OrdinalIgnoreCase));
         }
 
         private static bool ContainsFunctionWithWorkerRuntime(IEnumerable<FunctionMetadata> functions, string workerRuntime)
         {
-            if (string.Equals(workerRuntime, LanguageWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(workerRuntime, RpcWorkerConstants.DotNetLanguageWorkerName, StringComparison.OrdinalIgnoreCase))
             {
                 return functions.Any(f => dotNetLanguages.Any(l => l.Equals(f.Language, StringComparison.OrdinalIgnoreCase)));
             }
             if (functions != null && functions.Any())
             {
-                return functions.Any(f => f.Language.Equals(workerRuntime, StringComparison.OrdinalIgnoreCase));
+                return functions.Any(f => !string.IsNullOrEmpty(f.Language) && f.Language.Equals(workerRuntime, StringComparison.OrdinalIgnoreCase));
             }
             return false;
         }
 
-        public static bool CheckAppOffline(string scriptPath)
+        internal static IEnumerable<FunctionMetadata> GetValidFunctions(IEnumerable<FunctionMetadata> indexedFunctions, ICollection<FunctionDescriptor> functionDescriptors)
         {
+            if (indexedFunctions == null || !indexedFunctions.Any())
+            {
+                return indexedFunctions;
+            }
+            if (functionDescriptors == null)
+            {
+                // No valid functions
+                return null;
+            }
+            return indexedFunctions.Where(m => functionDescriptors.Select(fd => fd.Metadata.Name).Contains(m.Name) == true);
+        }
+
+        public static async Task MarkContainerDisabled(ILogger logger)
+        {
+            logger.LogDebug("Setting container instance offline");
+            var disableContainerFilePath = Path.Combine(Path.GetTempPath(), ScriptConstants.DisableContainerFileName);
+            if (!FileUtility.FileExists(disableContainerFilePath))
+            {
+                await FileUtility.WriteAsync(disableContainerFilePath, "This container instance is offline");
+            }
+        }
+
+        public static bool IsContainerDisabled()
+        {
+            return FileUtility.FileExists(Path.Combine(Path.GetTempPath(), ScriptConstants.DisableContainerFileName));
+        }
+
+        public static bool CheckAppOffline(IEnvironment environment, string scriptPath)
+        {
+            // Linux container environments have an additional way of putting a specific worker instance offline.
+            if (environment.IsLinuxConsumptionContainerDisabled())
+            {
+                return true;
+            }
+
             // check if we should be in an offline state
             string offlineFilePath = Path.Combine(scriptPath, ScriptConstants.AppOfflineFileName);
-            if (File.Exists(offlineFilePath))
+            if (FileUtility.FileExists(offlineFilePath))
             {
                 return true;
             }
             return false;
+        }
+
+        public static void ExecuteAfterDelay(Action targetAction, TimeSpan delay, CancellationToken cancellationToken = default)
+        {
+            Task.Delay(delay, cancellationToken).ContinueWith(_ =>
+            {
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    targetAction();
+                }
+            }, TaskContinuationOptions.OnlyOnRanToCompletion);
+        }
+
+        public static void ExecuteAfterColdStartDelay(IEnvironment environment, Action targetAction, CancellationToken cancellationToken = default)
+        {
+            // for Dynamic SKUs where coldstart is important, we want to delay the action
+            if (environment.IsDynamicSku())
+            {
+                ExecuteAfterDelay(targetAction, TimeSpan.FromMilliseconds(ColdStartDelayMS), cancellationToken);
+            }
+            else
+            {
+                targetAction();
+            }
         }
 
         public static bool TryCleanUrl(string url, out string cleaned)
@@ -557,6 +733,34 @@ namespace Microsoft.Azure.WebJobs.Script
                 return true;
             }
             return false;
+        }
+
+        /// <summary>
+        /// Computes a stable non-cryptographic hash
+        /// </summary>
+        /// <param name="value">The string to use for computation</param>
+        /// <returns>A stable, non-cryptographic, hash</returns>
+        internal static int GetStableHash(string value)
+        {
+            if (value == null)
+            {
+                throw new ArgumentNullException(nameof(value));
+            }
+
+            unchecked
+            {
+                int hash = 23;
+                foreach (char c in value)
+                {
+                    hash = (hash * 31) + c;
+                }
+                return hash;
+            }
+        }
+
+        public static string BuildStorageConnectionString(string accountName, string accessKey)
+        {
+            return $"DefaultEndpointsProtocol=https;AccountName={accountName};AccountKey={accessKey}";
         }
 
         private class FilteredExpandoObjectConverter : ExpandoObjectConverter

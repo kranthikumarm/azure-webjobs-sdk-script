@@ -8,13 +8,10 @@ using System.IO.Compression;
 using System.Linq;
 using System.Net.Http;
 using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Configuration;
 using Microsoft.Azure.WebJobs.Script.Diagnostics.Extensions;
-using Microsoft.Azure.WebJobs.Script.Properties;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Azure.WebJobs.Script.Models;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
 using NuGet.Versioning;
 
@@ -26,6 +23,7 @@ namespace Microsoft.Azure.WebJobs.Script.ExtensionBundle
         private readonly ExtensionBundleOptions _options;
         private readonly ILogger _logger;
         private readonly string _cdnUri;
+        private string _extensionBundleVersion;
 
         public ExtensionBundleManager(ExtensionBundleOptions options, IEnvironment environment, ILoggerFactory loggerFactory)
         {
@@ -35,9 +33,37 @@ namespace Microsoft.Azure.WebJobs.Script.ExtensionBundle
             _options = options ?? throw new ArgumentNullException(nameof(options));
         }
 
+        public async Task<ExtensionBundleDetails> GetExtensionBundleDetails()
+        {
+            if (IsExtensionBundleConfigured())
+            {
+                if (_extensionBundleVersion == null && TryLocateExtensionBundle(out string path))
+                {
+                    _extensionBundleVersion = Path.GetFileName(path);
+                }
+
+                _extensionBundleVersion = _extensionBundleVersion ?? await GetLatestMatchingBundleVersionAsync();
+
+                return new ExtensionBundleDetails()
+                {
+                    Id = _options.Id,
+                    Version = _extensionBundleVersion
+                };
+            }
+
+            return null;
+        }
+
         public bool IsExtensionBundleConfigured()
         {
             return !string.IsNullOrEmpty(_options.Id) && !string.IsNullOrEmpty(_options.Version?.OriginalString);
+        }
+
+        public bool IsLegacyExtensionBundle()
+        {
+            return IsExtensionBundleConfigured()
+                && _options.Id == ScriptConstants.DefaultExtensionBundleId
+                && (_options.Version.MaxVersion <= ScriptConstants.ExtensionBundleVersionTwo && !_options.Version.IsMaxInclusive);
         }
 
         /// <summary>
@@ -66,18 +92,19 @@ namespace Microsoft.Azure.WebJobs.Script.ExtensionBundle
         {
             bool bundleFound = TryLocateExtensionBundle(out string bundlePath);
 
-            if ((_environment.IsAppServiceEnvironment()
-                || _environment.IsCoreToolsEnvironment()
-                || _environment.IsLinuxContainerEnvironment()
-                || _environment.IsContainerEnvironment())
+            if ((_environment.IsAppService()
+                || _environment.IsCoreTools()
+                || _environment.IsLinuxConsumption()
+                || _environment.IsContainer())
                 && (!bundleFound || _options.EnsureLatest))
             {
-                string latestBundleVersion = await GetLatestMatchingBundleVersion(httpClient);
+                string latestBundleVersion = await GetLatestMatchingBundleVersionAsync(httpClient);
                 if (string.IsNullOrEmpty(latestBundleVersion))
                 {
                     return null;
                 }
 
+                _extensionBundleVersion = latestBundleVersion;
                 bundlePath = await DownloadExtensionBundleAsync(latestBundleVersion, httpClient);
             }
             return bundlePath;
@@ -167,7 +194,15 @@ namespace Microsoft.Azure.WebJobs.Script.ExtensionBundle
             return true;
         }
 
-        private async Task<string> GetLatestMatchingBundleVersion(HttpClient httpClient)
+        private async Task<string> GetLatestMatchingBundleVersionAsync()
+        {
+            using (var httpClient = new HttpClient())
+            {
+                return await GetLatestMatchingBundleVersionAsync(httpClient);
+            }
+        }
+
+        private async Task<string> GetLatestMatchingBundleVersionAsync(HttpClient httpClient)
         {
             var uri = new Uri($"{_cdnUri}/{ScriptConstants.ExtensionBundleDirectory}/{_options.Id}/{ScriptConstants.ExtensionBundleVersionIndexFile}");
             _logger.FetchingVersionInfo(_options.Id, uri);

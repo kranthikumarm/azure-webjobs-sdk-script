@@ -107,18 +107,21 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 { inputParameter.Name, invocation.Input }
             };
 
-            Task.Run(async () =>
+            using (System.Threading.ExecutionContext.SuppressFlow())
             {
-                IDictionary<string, object> loggerScope = new Dictionary<string, object>
+                Task.Run(async () =>
                 {
-                    { "MS_IgnoreActivity", null }
-                };
+                    IDictionary<string, object> loggerScope = new Dictionary<string, object>
+                    {
+                        { "MS_IgnoreActivity", null }
+                    };
 
-                using (_logger.BeginScope(loggerScope))
-                {
-                    await scriptHost.CallAsync(function.Name, arguments);
-                }
-            });
+                    using (_logger.BeginScope(loggerScope))
+                    {
+                        await scriptHost.CallAsync(function.Name, arguments);
+                    }
+                });
+            }
 
             return Accepted();
         }
@@ -164,7 +167,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
                 return NotFound();
             }
 
-            (var deleted, var error) = _functionsManager.TryDeleteFunction(function);
+            (var deleted, var error) = await _functionsManager.TryDeleteFunction(function);
 
             if (deleted)
             {

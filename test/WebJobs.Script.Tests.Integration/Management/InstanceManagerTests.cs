@@ -17,6 +17,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.WebJobs.Script.Tests;
 using Moq;
 using Moq.Protected;
+using Newtonsoft.Json;
 using Xunit;
 
 namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
@@ -45,7 +46,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             _environment = new TestEnvironmentEx();
             _scriptWebEnvironment = new ScriptWebHostEnvironment(_environment);
 
-            _instanceManager = new InstanceManager(_optionsFactory, _httpClient, _scriptWebEnvironment, _environment, _loggerFactory.CreateLogger<InstanceManager>(), new TestMetricsLogger());
+            _instanceManager = new InstanceManager(_optionsFactory, _httpClient, _scriptWebEnvironment, _environment, _loggerFactory.CreateLogger<InstanceManager>(), new TestMetricsLogger(), null);
 
             InstanceManager.Reset();
         }
@@ -58,6 +59,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Name = Path.GetTempFileName().Replace(".", string.Empty),
                 Value = Guid.NewGuid().ToString()
             };
+            var allowedOrigins = new string[]
+            {
+                "https://functions.azure.com",
+                "https://functions-staging.azure.com",
+                "https://functions-next.azure.com"
+            };
+            var supportCredentials = true;
 
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1");
             var context = new HostAssignmentContext
@@ -65,9 +73,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = new Dictionary<string, string>
                 {
                     { envValue.Name, envValue.Value }
-                }
+                },
+                CorsSettings = new CorsSettings
+                {
+                    AllowedOrigins = allowedOrigins,
+                    SupportCredentials = supportCredentials,
+                },
             };
-            bool result = _instanceManager.StartAssignment(context);
+            bool result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.True(result);
             Assert.True(_scriptWebEnvironment.InStandbyMode);
 
@@ -76,6 +89,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 
             var value = _environment.GetEnvironmentVariable(envValue.Name);
             Assert.Equal(value, envValue.Value);
+
+            var supportCredentialsValue = _environment.GetEnvironmentVariable(EnvironmentSettingNames.CorsSupportCredentials);
+            Assert.Equal(supportCredentialsValue, supportCredentials.ToString());
+
+            var allowedOriginsValue = _environment.GetEnvironmentVariable(EnvironmentSettingNames.CorsAllowedOrigins);
+            Assert.Equal(allowedOriginsValue, JsonConvert.SerializeObject(allowedOrigins));
 
             // verify logs
             var logs = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).ToArray();
@@ -87,7 +106,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             // calling again should return false, since we're no longer
             // in placeholder mode
             _loggerProvider.ClearAllLogMessages();
-            result = _instanceManager.StartAssignment(context);
+            result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.False(result);
 
             logs = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).ToArray();
@@ -107,7 +126,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                     { "throw", "test" }
                 }
             };
-            bool result = _instanceManager.StartAssignment(context);
+            bool result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.True(result);
             Assert.True(_scriptWebEnvironment.InStandbyMode);
 
@@ -120,13 +139,13 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 
         [Fact]
         public async Task StartAssignment_Succeeds_With_No_RunFromPackage_AppSetting()
-        { 
+        {
             _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1");
             var context = new HostAssignmentContext
             {
                 Environment = new Dictionary<string, string>()
             };
-            bool result = _instanceManager.StartAssignment(context);
+            bool result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.True(result);
             Assert.True(_scriptWebEnvironment.InStandbyMode);
 
@@ -140,11 +159,11 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
         }
 
         [Fact]
-        public  async void StartAssignment_Succeeds_With_NonEmpty_ScmRunFromPackage_Blob()
+        public async void StartAssignment_Succeeds_With_NonEmpty_ScmRunFromPackage_Blob()
         {
             var contentRoot = Path.Combine(Path.GetTempPath(), @"FunctionsTest");
             var zipFilePath = Path.Combine(contentRoot, "content.zip");
-            await TestHelpers.CreateContentZip(contentRoot, zipFilePath, @"TestScripts\DotNet");
+            await TestHelpers.CreateContentZip(contentRoot, zipFilePath, Path.Combine(@"TestScripts", "DotNet"));
 
             IConfiguration configuration = TestHelpers.GetTestConfiguration();
             string connectionString = configuration.GetWebJobsConnectionString(ConnectionStringNames.Storage);
@@ -158,7 +177,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                     { EnvironmentSettingNames.ScmRunFromPackage, sasUri.ToString() }
                 }
             };
-            bool result = _instanceManager.StartAssignment(context);
+            bool result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.True(result);
 
             Thread.Sleep(assignmentWaitPeriod);
@@ -172,8 +191,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 p => Assert.StartsWith("Downloading zip contents from", p),
                 p => Assert.EndsWith(" bytes downloaded", p),
                 p => Assert.EndsWith(" bytes written", p),
-                p => Assert.StartsWith("Extracting files to ", p),
-                p => Assert.StartsWith("Zip extraction complete", p),
+                p => Assert.StartsWith("Running: ", p),
+                p => Assert.StartsWith("Output:", p),
+                p => Assert.True(p.StartsWith("bash:") || p.StartsWith("/usr/bin/bash:")),
+                p => Assert.StartsWith("exitCode:", p),
                 p => Assert.StartsWith("Triggering specialization", p));
         }
 
@@ -192,7 +213,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                     { EnvironmentSettingNames.ScmRunFromPackage, sasUri.ToString() }
                 }
             };
-            bool result = _instanceManager.StartAssignment(context);
+            bool result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.True(result);
 
             Thread.Sleep(assignmentWaitPeriod);
@@ -203,6 +224,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
             Assert.Collection(logs,
                 p => Assert.StartsWith("Starting Assignment", p),
                 p => Assert.StartsWith("Applying 1 app setting(s)", p),
+                p => Assert.StartsWith($"{EnvironmentSettingNames.ScmRunFromPackage} points to an empty location. Function app has no content.", p),
                 p => Assert.StartsWith("Triggering specialization", p));
         }
 
@@ -213,7 +235,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 
             var context = new HostAssignmentContext();
             context.Environment = new Dictionary<string, string>();
-            bool result = _instanceManager.StartAssignment(context);
+            bool result = _instanceManager.StartAssignment(context, isWarmup: false);
             Assert.False(result);
         }
 
@@ -231,7 +253,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = environment
             };
 
-            string error = await _instanceManager.ValidateContext(assignmentContext);
+            string error = await _instanceManager.ValidateContext(assignmentContext, isWarmup: false);
             Assert.Equal("Invalid zip url specified (StatusCode: NotFound)", error);
 
             var logs = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).ToArray();
@@ -255,7 +277,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = environment
             };
 
-            string error = await _instanceManager.ValidateContext(assignmentContext);
+            string error = await _instanceManager.ValidateContext(assignmentContext, isWarmup: false);
             Assert.Null(error);
 
             string[] expectedOutputLines =
@@ -286,7 +308,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = environment
             };
 
-            string error = await _instanceManager.ValidateContext(assignmentContext);
+            string error = await _instanceManager.ValidateContext(assignmentContext, isWarmup: false);
             Assert.Null(error);
 
             string[] expectedOutputLines =
@@ -318,7 +340,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = environment
             };
 
-            string error = await _instanceManager.ValidateContext(assignmentContext);
+            string error = await _instanceManager.ValidateContext(assignmentContext, isWarmup: false);
             Assert.Null(error);
 
             string[] expectedOutputLines =
@@ -350,7 +372,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = environment
             };
 
-            string error = await _instanceManager.ValidateContext(assignmentContext);
+            string error = await _instanceManager.ValidateContext(assignmentContext, isWarmup: false);
             Assert.Null(error);
 
             string[] expectedOutputLines =
@@ -381,7 +403,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 Environment = environment
             };
 
-            string error = await _instanceManager.SpecializeMSISidecar(assignmentContext);
+            string error = await _instanceManager.SpecializeMSISidecar(assignmentContext, isWarmup: false);
             Assert.Null(error);
 
             var logs = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).ToArray();
@@ -405,7 +427,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 
             var instanceManager = GetInstanceManagerForMSISpecialization(assignmentContext, HttpStatusCode.OK);
 
-            string error = await instanceManager.SpecializeMSISidecar(assignmentContext);
+            string error = await instanceManager.SpecializeMSISidecar(assignmentContext, isWarmup: false);
             Assert.Null(error);
 
             var logs = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).ToArray();
@@ -432,7 +454,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
 
             var instanceManager = GetInstanceManagerForMSISpecialization(assignmentContext, HttpStatusCode.BadRequest);
 
-            string error = await instanceManager.SpecializeMSISidecar(assignmentContext);
+            string error = await instanceManager.SpecializeMSISidecar(assignmentContext, isWarmup: false);
             Assert.NotNull(error);
 
             var logs = _loggerProvider.GetAllLogMessages().Select(p => p.FormattedMessage).ToArray();
@@ -443,25 +465,134 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.Managment
                 p => Assert.StartsWith("Specialize MSI sidecar call failed. StatusCode=BadRequest", p));
         }
 
+        [Fact(Skip = "https://github.com/Azure/azure-functions-host/issues/5261")]
+        public async Task Mounts_Valid_BYOS_Accounts()
+        {
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1");
+
+            const string account1 = "storageaccount1";
+            const string share1 = "share1";
+            const string accessKey1 = "key1key1key1==";
+            const string targetPath1 = "/data";
+
+            const string account2 = "storageaccount2";
+            const string share2 = "share2";
+            const string accessKey2 = "key2key2key2==";
+            const string targetPath2 = "/data/store2";
+
+            const string account3 = "storageaccount3";
+            const string share3 = "share3";
+            const string accessKey3 = "key3key3key3==";
+            const string targetPath3 = "/somepath";
+
+            var hostAssignmentContext = new HostAssignmentContext()
+            {
+                Environment = new Dictionary<string, string>
+                {
+                    [EnvironmentSettingNames.MsiSecret] = "secret",
+                    ["AZUREFILESSTORAGE_storage1"] = $"{account1}|{share1}|{accessKey1}|{targetPath1}",
+                    ["AZUREFILESSTORAGE_storage2"] = $"{account2}|{share2}|{accessKey2}|{targetPath2}",
+                    ["AZUREBLOBSTORAGE_blob1"] = $"{account3}|{share3}|{accessKey3}|{targetPath3}",
+                    [EnvironmentSettingNames.MsiEndpoint] = "endpoint",
+                },
+                SiteId = 1234,
+                SiteName = "TestSite"
+            };
+
+            var meshInitServiceClient = new Mock<IMeshServiceClient>(MockBehavior.Strict);
+            meshInitServiceClient.Setup(client =>
+                    client.MountCifs(Utility.BuildStorageConnectionString(account1, accessKey1), share1, targetPath1))
+                .Throws(new Exception("Mount failure"));
+            meshInitServiceClient.Setup(client =>
+                client.MountCifs(Utility.BuildStorageConnectionString(account2, accessKey2), share2, targetPath2)).Returns(Task.FromResult(true));
+            meshInitServiceClient.Setup(client =>
+                client.MountBlob(Utility.BuildStorageConnectionString(account3, accessKey3), share3, targetPath3)).Returns(Task.FromResult(true));
+
+            var instanceManager = new InstanceManager(_optionsFactory, _httpClient, _scriptWebEnvironment, _environment,
+                _loggerFactory.CreateLogger<InstanceManager>(), new TestMetricsLogger(), meshInitServiceClient.Object);
+
+            instanceManager.StartAssignment(hostAssignmentContext, false);
+
+            await Task.Delay(TimeSpan.FromSeconds(0.5));
+
+            meshInitServiceClient.Verify(
+                client => client.MountCifs(Utility.BuildStorageConnectionString(account1, accessKey1), share1,
+                    targetPath1), Times.Exactly(2));
+            meshInitServiceClient.Verify(
+                client => client.MountCifs(Utility.BuildStorageConnectionString(account2, accessKey2), share2,
+                    targetPath2), Times.Once);
+            meshInitServiceClient.Verify(
+                client => client.MountBlob(Utility.BuildStorageConnectionString(account3, accessKey3), share3,
+                    targetPath3), Times.Once);
+        }
+
+        [Fact]
+        public async Task Does_Not_Mount_Invalid_BYOS_Accounts()
+        {
+            _environment.SetEnvironmentVariable(EnvironmentSettingNames.AzureWebsitePlaceholderMode, "1");
+
+            const string account1 = "storageaccount1";
+            const string share1 = "share1";
+            const string accessKey1 = "key1key1key1==";
+            const string targetPath1 = "/data";
+
+            const string account2 = "storageaccount2";
+            const string share2 = "share2";
+            const string accessKey2 = "key2key2key2==";
+
+            var hostAssignmentContext = new HostAssignmentContext()
+            {
+                Environment = new Dictionary<string, string>
+                {
+                    [EnvironmentSettingNames.MsiSecret] = "secret",
+                    ["AZUREFILESSTORAGE_storage1"] = $"{account1}|{share1}|{accessKey1}|{targetPath1}",
+                    ["AZUREFILESSTORAGE_storage2"] = $"{account2}|{share2}|{accessKey2}",
+                    ["AZUREBLOBSTORAGE_blob1"] = $"",
+                    [EnvironmentSettingNames.MsiEndpoint] = "endpoint",
+                },
+                SiteId = 1234,
+                SiteName = "TestSite"
+            };
+
+            var meshInitServiceClient = new Mock<IMeshServiceClient>(MockBehavior.Strict);
+
+            meshInitServiceClient.Setup(client =>
+                client.MountCifs(Utility.BuildStorageConnectionString(account1, accessKey1), share1, targetPath1)).Returns(Task.FromResult(true));
+
+            var instanceManager = new InstanceManager(_optionsFactory, _httpClient, _scriptWebEnvironment, _environment,
+                _loggerFactory.CreateLogger<InstanceManager>(), new TestMetricsLogger(), meshInitServiceClient.Object);
+
+            instanceManager.StartAssignment(hostAssignmentContext, false);
+
+            await Task.Delay(TimeSpan.FromSeconds(0.5));
+
+            meshInitServiceClient.Verify(
+                client => client.MountCifs(Utility.BuildStorageConnectionString(account1, accessKey1), share1,
+                    targetPath1), Times.Once);
+
+            meshInitServiceClient.Verify(
+                client => client.MountCifs(It.IsAny<string>(), It.IsAny<string>(), It.Is<string>(s => s != targetPath1)), Times.Never());
+        }
+
         private InstanceManager GetInstanceManagerForMSISpecialization(HostAssignmentContext hostAssignmentContext, HttpStatusCode httpStatusCode)
         {
             var handlerMock = new Mock<HttpMessageHandler>(MockBehavior.Strict);
 
             var msiEndpoint = hostAssignmentContext.Environment[EnvironmentSettingNames.MsiEndpoint] + ScriptConstants.LinuxMSISpecializationStem;
 
-            handlerMock.Protected().Setup<Task<HttpResponseMessage>>("SendAsync", 
-                ItExpr.Is<HttpRequestMessage>(request => request.Method == HttpMethod.Post 
+            handlerMock.Protected().Setup<Task<HttpResponseMessage>>("SendAsync",
+                ItExpr.Is<HttpRequestMessage>(request => request.Method == HttpMethod.Post
                                                          && request.RequestUri.AbsoluteUri.Equals(msiEndpoint)
-                                                         && request.Content != null), 
+                                                         && request.Content != null),
                 ItExpr.IsAny<CancellationToken>()).ReturnsAsync(new HttpResponseMessage
-            {
-                StatusCode = httpStatusCode
-            });
+                {
+                    StatusCode = httpStatusCode
+                });
 
             InstanceManager.Reset();
 
             return new InstanceManager(_optionsFactory, new HttpClient(handlerMock.Object), _scriptWebEnvironment, _environment,
-                _loggerFactory.CreateLogger<InstanceManager>(), new TestMetricsLogger());
+                _loggerFactory.CreateLogger<InstanceManager>(), new TestMetricsLogger(), null);
         }
 
         public void Dispose()

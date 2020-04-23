@@ -14,6 +14,11 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
     {
         private readonly ICollection<ServiceDescriptor> _requiredDescriptors = new Collection<ServiceDescriptor>();
         private readonly ICollection<ServiceDescriptor> _optionalDescriptors = new Collection<ServiceDescriptor>();
+
+        // We may not be able to load the type at all -- for example third-party services that we want to allow.
+        // For this, track the types as strings and we'll match them during IsMatch. These will always be optional.
+        private readonly ICollection<ExternalService> _optionalExternalServices = new Collection<ExternalService>();
+
         private readonly MatchType _match;
 
         private ServiceMatch(Type serviceType, MatchType match)
@@ -108,6 +113,13 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
             Add(desc);
         }
 
+        public void AddInstance<TInstanceType>()
+        {
+            // Hijack the instance property pass in the expected type
+            ServiceDescriptor desc = new ServiceDescriptor(ServiceType, typeof(TInstanceType));
+            Add(desc);
+        }
+
         private void Add(ServiceDescriptor desc)
         {
             if (_match == MatchType.Single && _requiredDescriptors.Any())
@@ -127,6 +139,16 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
 
             ServiceDescriptor desc = new ServiceDescriptor(ServiceType, typeof(TImplementation), lifetime);
             _optionalDescriptors.Add(desc);
+        }
+
+        public void AddOptionalExternal(string externalTypeName, string assemblyName, string assemblyPublicKey)
+        {
+            if (_match != MatchType.Collection)
+            {
+                throw new InvalidOperationException("Optional matches only apply to Collections.");
+            }
+
+            _optionalExternalServices.Add(new ExternalService(externalTypeName, assemblyName, assemblyPublicKey));
         }
 
         public IEnumerable<InvalidServiceDescriptor> FindInvalidServices(IServiceCollection services)
@@ -156,7 +178,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
                     return Enumerable.Empty<InvalidServiceDescriptor>();
 
                 case MatchType.Collection:
-                    return FindCollectionDifferences(registered, _requiredDescriptors, _optionalDescriptors);
+                    return FindCollectionDifferences(registered, _requiredDescriptors, _optionalDescriptors, _optionalExternalServices);
 
                 case MatchType.Subcollection:
                     return FindMissingServicesInCollection(registered, _requiredDescriptors);
@@ -168,7 +190,8 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
 
         private static bool IsMatch(ServiceDescriptor expected, ServiceDescriptor registered)
         {
-            bool factoryMatches = false;
+            bool factoryMatches = expected.ImplementationFactory == registered.ImplementationFactory;
+            bool instanceMatches = expected.ImplementationInstance == registered.ImplementationInstance;
 
             if (expected.ImplementationFactory != null && registered.ImplementationFactory != null)
             {
@@ -178,25 +201,34 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
                 Assembly expectedAssembly = (Assembly)expected.ImplementationFactory(null);
                 factoryMatches = expectedAssembly == registered.ImplementationFactory.GetMethodInfo().DeclaringType.Assembly;
             }
-            else
+            else if (expected.ImplementationInstance != null && registered.ImplementationInstance != null)
             {
-                factoryMatches = expected.ImplementationFactory == registered.ImplementationFactory;
+                // A non-null ImplementationInstance signals we expect this to be an Instance, and we've
+                // stored the type we expect in the expected ServiceDescriptor.
+                Type expectedInstanceType = expected.ImplementationInstance as Type;
+                instanceMatches = expectedInstanceType == registered.ImplementationInstance.GetType();
             }
 
             return factoryMatches &&
-                expected.ImplementationInstance == registered.ImplementationInstance &&
+                instanceMatches &&
                 expected.ImplementationType == registered.ImplementationType &&
                 expected.Lifetime == registered.Lifetime &&
                 expected.ServiceType == registered.ServiceType;
         }
 
-        private static IEnumerable<InvalidServiceDescriptor> FindCollectionDifferences(IEnumerable<ServiceDescriptor> registeredServices, IEnumerable<ServiceDescriptor> expectedServices, IEnumerable<ServiceDescriptor> optionalServices)
+        private static IEnumerable<InvalidServiceDescriptor> FindCollectionDifferences(IEnumerable<ServiceDescriptor> registeredServices, IEnumerable<ServiceDescriptor> expectedServices,
+            IEnumerable<ServiceDescriptor> optionalServices, IEnumerable<ExternalService> optionalExternalServices)
         {
             // Don't report optional services as missing.
             var missingServices = FindMissingServicesInCollection(registeredServices, expectedServices);
 
             var extraServices = registeredServices
-                .Where(r => !expectedServices.Any(e => IsMatch(e, r)) && !optionalServices.Any(o => IsMatch(o, r)))
+                .Where(r =>
+                {
+                    return !expectedServices.Any(e => IsMatch(e, r))
+                        && !optionalServices.Any(o => IsMatch(o, r))
+                        && !optionalExternalServices.Any(o => o.IsMatch(r.ImplementationType));
+                })
                 .Select(p => new InvalidServiceDescriptor(p, InvalidServiceDescriptorReason.Invalid));
 
             return missingServices.Concat(extraServices);
@@ -207,6 +239,53 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.DependencyInjection
             return expectedServices
                 .Where(e => !registeredServices.Any(r => IsMatch(e, r)))
                 .Select(p => new InvalidServiceDescriptor(p, InvalidServiceDescriptorReason.Missing));
+        }
+
+        private class ExternalService
+        {
+            public ExternalService(string typeName, string assemblyName, string assemblyPublicKey)
+            {
+                TypeName = typeName;
+                AssemblyName = assemblyName;
+                AssemblyPublicKey = assemblyPublicKey;
+            }
+
+            public string TypeName { get; }
+
+            public string AssemblyName { get; }
+
+            public string AssemblyPublicKey { get; }
+
+            public bool IsMatch(Type serviceType)
+            {
+                if (serviceType == null)
+                {
+                    return false;
+                }
+
+                var serviceAssemblyName = serviceType.Assembly.GetName();
+
+                return serviceType.FullName == TypeName
+                    && serviceAssemblyName.Name == AssemblyName
+                    && GetPublicKeyTokenString(serviceAssemblyName.GetPublicKeyToken()) == AssemblyPublicKey;
+            }
+
+            private static string GetPublicKeyTokenString(byte[] token)
+            {
+                if (token == null || token.Length == 0)
+                {
+                    return null;
+                }
+
+                string tokenString = string.Empty;
+
+                for (int i = 0; i < token.Length; i++)
+                {
+                    tokenString += string.Format("{0:x2}", token[i]);
+                }
+
+                return tokenString;
+            }
         }
     }
 }

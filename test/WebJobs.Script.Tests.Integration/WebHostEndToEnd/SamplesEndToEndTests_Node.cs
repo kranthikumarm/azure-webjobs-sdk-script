@@ -16,10 +16,10 @@ using Microsoft.Azure.EventHubs;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Config;
 using Microsoft.Azure.WebJobs.Script.Models;
-using Microsoft.Azure.WebJobs.Script.Rpc;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.WebJobs.Script.Tests;
-using Microsoft.WindowsAzure.Storage.Blob;
+using Microsoft.Azure.Storage.Blob;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -385,7 +385,12 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
             {
                 request = new HttpRequestMessage(HttpMethod.Get, uri);
                 response = await _fixture.Host.HttpClient.SendAsync(request);
-                timestamp = response.Headers.GetValues("Shared-Module").First();
+
+                if (response.Headers.Contains("Shared-Module"))
+                {
+                    timestamp = response.Headers.GetValues("Shared-Module").First();
+                }
+
                 return initialTimestamp != timestamp;
             }, timeout: 5000, pollingInterval: 500);
             Assert.NotEqual(initialTimestamp, timestamp);
@@ -446,7 +451,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.EndToEnd
 
             // Microsoft.Azure.WebJobs.Extensions.EventHubs
             public TestFixture()
-                : base(Path.Combine(Environment.CurrentDirectory, @"..\..\..\..\..\sample\node"), "samples", LanguageWorkerConstants.NodeLanguageWorkerName)
+                : base(Path.Combine(Environment.CurrentDirectory, @"..\..\..\..\..\sample\node"), "samples", RpcWorkerConstants.NodeLanguageWorkerName)
             {
             }
 

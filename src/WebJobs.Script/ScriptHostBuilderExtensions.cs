@@ -22,9 +22,12 @@ using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
 using Microsoft.Azure.WebJobs.Script.FileProvisioning;
 using Microsoft.Azure.WebJobs.Script.Grpc;
 using Microsoft.Azure.WebJobs.Script.Grpc.Messages;
+using Microsoft.Azure.WebJobs.Script.Http;
 using Microsoft.Azure.WebJobs.Script.ManagedDependencies;
-using Microsoft.Azure.WebJobs.Script.Rpc;
 using Microsoft.Azure.WebJobs.Script.Scale;
+using Microsoft.Azure.WebJobs.Script.Workers;
+using Microsoft.Azure.WebJobs.Script.Workers.Http;
+using Microsoft.Azure.WebJobs.Script.Workers.Rpc;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
@@ -52,10 +55,10 @@ namespace Microsoft.Azure.WebJobs.Script
             return builder.AddScriptHost(options, loggerFactory, null);
         }
 
-        public static IHostBuilder AddScriptHost(this IHostBuilder builder, ScriptApplicationHostOptions applicationOptions, Action<IWebJobsBuilder> configureWebJobs = null)
-            => builder.AddScriptHost(applicationOptions, null, configureWebJobs);
+        public static IHostBuilder AddScriptHost(this IHostBuilder builder, ScriptApplicationHostOptions applicationOptions, Action<IWebJobsBuilder> configureWebJobs = null, IMetricsLogger metricsLogger = null)
+            => builder.AddScriptHost(applicationOptions, null, metricsLogger, configureWebJobs);
 
-        public static IHostBuilder AddScriptHost(this IHostBuilder builder, ScriptApplicationHostOptions applicationOptions, ILoggerFactory loggerFactory, Action<IWebJobsBuilder> configureWebJobs = null)
+        public static IHostBuilder AddScriptHost(this IHostBuilder builder, ScriptApplicationHostOptions applicationOptions, ILoggerFactory loggerFactory, IMetricsLogger metricsLogger, Action<IWebJobsBuilder> configureWebJobs = null)
         {
             loggerFactory = loggerFactory ?? NullLoggerFactory.Instance;
 
@@ -68,6 +71,7 @@ namespace Microsoft.Azure.WebJobs.Script
                 string loggingPath = ConfigurationPath.Combine(ConfigurationSectionNames.JobHost, "Logging");
                 loggingBuilder.AddConfiguration(context.Configuration.GetSection(loggingPath));
 
+                loggingBuilder.Services.AddSingleton<IFileWriterFactory, DefaultFileWriterFactory>();
                 loggingBuilder.Services.AddSingleton<ILoggerProvider, HostFileLoggerProvider>();
                 loggingBuilder.Services.AddSingleton<ILoggerProvider, FunctionFileLoggerProvider>();
 
@@ -79,15 +83,15 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 if (!context.Properties.ContainsKey(ScriptConstants.SkipHostJsonConfigurationKey))
                 {
-                    configBuilder.Add(new HostJsonFileConfigurationSource(applicationOptions, SystemEnvironment.Instance, loggerFactory));
+                    configBuilder.Add(new HostJsonFileConfigurationSource(applicationOptions, SystemEnvironment.Instance, loggerFactory, metricsLogger));
                 }
             });
 
             // WebJobs configuration
-            return builder.AddScriptHostCore(applicationOptions, configureWebJobs, loggerFactory);
+            return builder.AddScriptHostCore(applicationOptions, metricsLogger, configureWebJobs, loggerFactory);
         }
 
-        public static IHostBuilder AddScriptHostCore(this IHostBuilder builder, ScriptApplicationHostOptions applicationHostOptions, Action<IWebJobsBuilder> configureWebJobs = null, ILoggerFactory loggerFactory = null)
+        public static IHostBuilder AddScriptHostCore(this IHostBuilder builder, ScriptApplicationHostOptions applicationHostOptions, IMetricsLogger metricsLogger, Action<IWebJobsBuilder> configureWebJobs = null, ILoggerFactory loggerFactory = null)
         {
             var skipHostInitialization = builder.Properties.ContainsKey(ScriptConstants.SkipHostInitializationKey);
             builder.ConfigureWebJobs((context, webJobsBuilder) =>
@@ -102,17 +106,18 @@ namespace Microsoft.Azure.WebJobs.Script
                     o.SetResponse = HttpBinding.SetResponse;
                 })
                 .AddTimers()
-                .AddManualTrigger();
+                .AddManualTrigger()
+                .AddWarmup();
 
                 var extensionBundleOptions = GetExtensionBundleOptions(context);
                 var bundleManager = new ExtensionBundleManager(extensionBundleOptions, SystemEnvironment.Instance, loggerFactory);
+                webJobsBuilder.Services.AddSingleton<IExtensionBundleManager>(_ => bundleManager);
                 if (!skipHostInitialization)
                 {
                     // Only set our external startup if we're not suppressing host initialization
                     // as we don't want to load user assemblies otherwise.
-                    webJobsBuilder.UseScriptExternalStartup(applicationHostOptions.ScriptPath, loggerFactory, bundleManager);
+                    webJobsBuilder.UseScriptExternalStartup(applicationHostOptions, loggerFactory, bundleManager, metricsLogger);
                 }
-                webJobsBuilder.Services.AddSingleton<IExtensionBundleManager>(_ => bundleManager);
 
                 configureWebJobs?.Invoke(webJobsBuilder);
             }, o => o.AllowPartialHostStartup = true);
@@ -123,9 +128,17 @@ namespace Microsoft.Azure.WebJobs.Script
             {
                 // Core WebJobs/Script Host services
                 services.AddSingleton<ScriptHost>();
-                services.AddSingleton<IFunctionDispatcher, FunctionDispatcher>();
-                services.AddSingleton<IJobHostLanguageWorkerChannelManager, JobHostLanguageWorkerChannelManager>();
-                services.AddSingleton<IFunctionDispatcherLoadBalancer, FunctionDispatcherLoadBalancer>();
+
+                // HTTP Worker
+                services.AddSingleton<IHttpWorkerProcessFactory, HttpWorkerProcessFactory>();
+                services.AddSingleton<IHttpWorkerChannelFactory, HttpWorkerChannelFactory>();
+                services.AddSingleton<IHttpWorkerService, DefaultHttpWorkerService>();
+                // Rpc Worker
+                services.AddSingleton<IJobHostRpcWorkerChannelManager, JobHostRpcWorkerChannelManager>();
+                services.AddSingleton<IRpcFunctionInvocationDispatcherLoadBalancer, RpcFunctionInvocationDispatcherLoadBalancer>();
+
+                //Worker Function Invocation dispatcher
+                services.AddSingleton<IFunctionInvocationDispatcherFactory, FunctionInvocationDispatcherFactory>();
                 services.AddSingleton<IScriptJobHost>(p => p.GetRequiredService<ScriptHost>());
                 services.AddSingleton<IJobHost>(p => p.GetRequiredService<ScriptHost>());
                 services.AddSingleton<IFunctionMetadataManager, FunctionMetadataManager>();
@@ -133,8 +146,8 @@ namespace Microsoft.Azure.WebJobs.Script
                 services.AddSingleton<ITypeLocator, ScriptTypeLocator>();
                 services.AddSingleton<ScriptSettingsManager>();
                 services.AddTransient<IExtensionsManager, ExtensionsManager>();
+                services.TryAddSingleton<IHttpRoutesManager, DefaultHttpRouteManager>();
                 services.TryAddSingleton<IMetricsLogger, MetricsLogger>();
-                services.TryAddSingleton<IScriptJobHostEnvironment, ConsoleScriptJobHostEnvironment>();
                 services.AddTransient<IExtensionBundleContentProvider, ExtensionBundleContentProvider>();
 
                 // Script binding providers
@@ -149,12 +162,20 @@ namespace Microsoft.Azure.WebJobs.Script
                 services.ConfigureOptions<JobHostFunctionTimeoutOptionsSetup>();
                 // TODO: pgopa only add this to WebHostServiceCollection
                 services.ConfigureOptions<LanguageWorkerOptionsSetup>();
+                services.ConfigureOptions<HttpWorkerOptionsSetup>();
                 services.ConfigureOptions<ManagedDependencyOptionsSetup>();
                 services.AddOptions<FunctionResultAggregatorOptions>()
                     .Configure<IConfiguration>((o, c) =>
                     {
                         c.GetSection(ConfigurationSectionNames.JobHost)
                          .GetSection(ConfigurationSectionNames.Aggregator)
+                         .Bind(o);
+                    });
+                services.AddOptions<ScaleOptions>()
+                    .Configure<IConfiguration>((o, c) =>
+                    {
+                        c.GetSection(ConfigurationSectionNames.JobHost)
+                         .GetSection(ConfigurationSectionNames.Scale)
                          .Bind(o);
                     });
 
@@ -166,8 +187,15 @@ namespace Microsoft.Azure.WebJobs.Script
                     AddCommonServices(services);
                 }
 
-                services.AddSingleton<IHostedService, LanguageWorkerConsoleLogService>();
+                services.AddSingleton<IHostedService, WorkerConsoleLogService>();
                 services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, PrimaryHostCoordinator>());
+                services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, FunctionInvocationDispatcherShutdownManager>());
+
+                if (SystemEnvironment.Instance.IsRuntimeScaleMonitoringEnabled())
+                {
+                    services.TryAddEnumerable(ServiceDescriptor.Singleton<IHostedService, FunctionsScaleMonitorService>());
+                }
+                services.TryAddSingleton<FunctionsScaleManager>();
             });
 
             RegisterFileProvisioningService(builder);
@@ -189,11 +217,11 @@ namespace Microsoft.Azure.WebJobs.Script
             services.AddManagedHostedService<RpcInitializationService>();
             services.AddSingleton<FunctionRpc.FunctionRpcBase, FunctionRpcService>();
             services.AddSingleton<IRpcServer, GrpcServer>();
-            services.TryAddSingleton<ILanguageWorkerConsoleLogSource, LanguageWorkerConsoleLogSource>();
+            services.TryAddSingleton<IWorkerConsoleLogSource, WorkerConsoleLogSource>();
             services.AddSingleton<IWorkerProcessFactory, DefaultWorkerProcessFactory>();
-            services.AddSingleton<ILanguageWorkerProcessFactory, LanguageWorkerProcessFactory>();
-            services.AddSingleton<ILanguageWorkerChannelFactory, LanguageWorkerChannelFactory>();
-            services.TryAddSingleton<IWebHostLanguageWorkerChannelManager, WebHostLanguageWorkerChannelManager>();
+            services.AddSingleton<IRpcWorkerProcessFactory, RpcWorkerProcessFactory>();
+            services.AddSingleton<IRpcWorkerChannelFactory, RpcWorkerChannelFactory>();
+            services.TryAddSingleton<IWebHostRpcWorkerChannelManager, WebHostRpcWorkerChannelManager>();
             services.TryAddSingleton<IDebugManager, DebugManager>();
             services.TryAddSingleton<IDebugStateProvider, DebugStateProvider>();
             services.TryAddSingleton<IEnvironment>(SystemEnvironment.Instance);
@@ -202,10 +230,11 @@ namespace Microsoft.Azure.WebJobs.Script
             AddProcessRegistry(services);
         }
 
-        public static IWebJobsBuilder UseScriptExternalStartup(this IWebJobsBuilder builder, string rootScriptPath, ILoggerFactory loggerFactory, IExtensionBundleManager extensionBundleManager)
+        public static IWebJobsBuilder UseScriptExternalStartup(this IWebJobsBuilder builder, ScriptApplicationHostOptions applicationHostOptions, ILoggerFactory loggerFactory, IExtensionBundleManager extensionBundleManager, IMetricsLogger metricsLogger)
         {
-            var logger = loggerFactory.CreateLogger<ScriptStartupTypeLocator>() ?? throw new ArgumentNullException(nameof(loggerFactory));
-            return builder.UseExternalStartup(new ScriptStartupTypeLocator(rootScriptPath, logger, extensionBundleManager));
+            var logger = loggerFactory?.CreateLogger<ScriptStartupTypeLocator>() ?? throw new ArgumentNullException(nameof(loggerFactory));
+            var metadataServiceProvider = applicationHostOptions.RootServiceProvider.GetService<IFunctionMetadataProvider>();
+            return builder.UseExternalStartup(new ScriptStartupTypeLocator(applicationHostOptions.ScriptPath, logger, extensionBundleManager, metadataServiceProvider, metricsLogger), loggerFactory);
         }
 
         public static IHostBuilder SetAzureFunctionsEnvironment(this IHostBuilder builder)
@@ -228,24 +257,30 @@ namespace Microsoft.Azure.WebJobs.Script
         public static IHostBuilder SetAzureFunctionsConfigurationRoot(this IHostBuilder builder)
         {
             builder.ConfigureAppConfiguration(c =>
-             {
-                 c.AddInMemoryCollection(new Dictionary<string, string>
+            {
+                c.AddInMemoryCollection(new Dictionary<string, string>
                     {
                         { "AzureWebJobsConfigurationSection", ConfigurationSectionNames.JobHost }
                     });
-             });
+            });
 
             return builder;
         }
 
         internal static void ConfigureApplicationInsights(HostBuilderContext context, ILoggingBuilder builder)
         {
-            string appInsightsKey = context.Configuration[EnvironmentSettingNames.AppInsightsInstrumentationKey];
+            string appInsightsInstrumentationKey = context.Configuration[EnvironmentSettingNames.AppInsightsInstrumentationKey];
+            string appInsightsConnectionString = context.Configuration[EnvironmentSettingNames.AppInsightsConnectionString];
 
             // Initializing AppInsights services during placeholder mode as well to avoid the cost of JITting these objects during specialization
-            if (!string.IsNullOrEmpty(appInsightsKey) || SystemEnvironment.Instance.IsPlaceholderModeEnabled())
+            if (!string.IsNullOrEmpty(appInsightsInstrumentationKey) || !string.IsNullOrEmpty(appInsightsConnectionString) || SystemEnvironment.Instance.IsPlaceholderModeEnabled())
             {
-                builder.AddApplicationInsightsWebJobs(o => o.InstrumentationKey = appInsightsKey);
+                builder.AddApplicationInsightsWebJobs(o =>
+                {
+                    o.InstrumentationKey = appInsightsInstrumentationKey;
+                    o.ConnectionString = appInsightsConnectionString;
+                });
+
                 builder.Services.ConfigureOptions<ApplicationInsightsLoggerOptionsSetup>();
 
                 builder.Services.AddSingleton<ISdkVersionProvider, FunctionsSdkVersionProvider>();
@@ -284,7 +319,7 @@ namespace Microsoft.Azure.WebJobs.Script
 
         private static void RegisterFileProvisioningService(IHostBuilder builder)
         {
-            if (string.Equals(Environment.GetEnvironmentVariable(LanguageWorkerConstants.FunctionWorkerRuntimeSettingName), "powershell"))
+            if (string.Equals(Environment.GetEnvironmentVariable(RpcWorkerConstants.FunctionWorkerRuntimeSettingName), "powershell"))
             {
                 builder.ConfigureServices(services =>
                 {

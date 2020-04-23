@@ -11,6 +11,7 @@ using System.Threading.Tasks;
 using Microsoft.ApplicationInsights.Channel;
 using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.ApplicationInsights.Extensibility.Implementation;
+using Microsoft.Azure.AppService.Proxy.Common.Expressions;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Logging;
 using Microsoft.Azure.WebJobs.Script.Diagnostics;
@@ -19,6 +20,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions.Internal;
 using Microsoft.WebJobs.Script.Tests;
 using Newtonsoft.Json.Linq;
 using Xunit;
@@ -251,12 +253,17 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.ApplicationInsights
             // Validate the host startup traces. Order by message string as the requests may come in
             // slightly out-of-order or on different threads
             TraceTelemetry[] traces = null;
+            string routesManagerLogCategory = TypeNameHelper.GetTypeDisplayName(typeof(WebHost.WebScriptHostHttpRoutesManager));
 
             await TestHelpers.Await(() =>
             {
                 traces = _fixture.Channel.Telemetries
                     .OfType<TraceTelemetry>()
-                    .Where(t => t.Properties[LogConstants.CategoryNameKey].ToString().StartsWith("Host."))
+                    .Where(t =>
+                    {
+                        string category = t.Properties[LogConstants.CategoryNameKey].ToString();
+                        return category.StartsWith("Host.") || category.StartsWith(routesManagerLogCategory);
+                    })
                     .OrderBy(t => t.Message)
                     .ToArray();
 
@@ -274,7 +281,7 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.ApplicationInsights
                 !t.Message.StartsWith("Host Status")
             ).ToArray();
 
-            int expectedCount = 12;
+            int expectedCount = 14;
             Assert.True(traces.Length == expectedCount, $"Expected {expectedCount} messages, but found {traces.Length}. Actual logs:{Environment.NewLine}{string.Join(Environment.NewLine, traces.Select(t => t.Message))}");
 
             int idx = 0;
@@ -286,7 +293,10 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.ApplicationInsights
             ValidateTrace(traces[idx++], "Host initialized (", LogCategories.Startup);
             ValidateTrace(traces[idx++], "Host lock lease acquired by instance ID", ScriptConstants.LogCategoryHostGeneral);
             ValidateTrace(traces[idx++], "Host started (", LogCategories.Startup);
+            ValidateTrace(traces[idx++], "Initializing function HTTP routes" + Environment.NewLine 
+                + "Mapped function route 'api/HttpTrigger-Scenarios'", routesManagerLogCategory);
             ValidateTrace(traces[idx++], "Initializing Host", LogCategories.Startup);
+            ValidateTrace(traces[idx++], "Initializing Warmup Extension", LogCategories.CreateTriggerCategory("Warmup"));
             ValidateTrace(traces[idx++], "Job host started", LogCategories.Startup);
             ValidateTrace(traces[idx++], "Loading functions metadata", LogCategories.Startup);
             ValidateTrace(traces[idx++], "Starting Host (HostId=", LogCategories.Startup);
@@ -356,20 +366,20 @@ namespace Microsoft.Azure.WebJobs.Script.Tests.ApplicationInsights
                 // Every telemetry will have {originalFormat}, Category, Level, but we validate those elsewhere.
                 // We're only interested in the custom properties.
                 Assert.Equal("1", traces[0].Message);
-                Assert.Equal(6, traces[0].Properties.Count);
+                Assert.Equal(7, traces[0].Properties.Count);
                 Assert.Equal("customValue1", traces[0].Properties["prop__customKey1"]);
 
                 Assert.Equal("2", traces[1].Message);
-                Assert.Equal(7, traces[1].Properties.Count);
+                Assert.Equal(8, traces[1].Properties.Count);
                 Assert.Equal("customValue1", traces[1].Properties["prop__customKey1"]);
                 Assert.Equal("customValue2", traces[1].Properties["prop__customKey2"]);
 
                 Assert.Equal("3", traces[2].Message);
-                Assert.Equal(6, traces[2].Properties.Count);
+                Assert.Equal(7, traces[2].Properties.Count);
                 Assert.Equal("customValue1", traces[2].Properties["prop__customKey1"]);
 
                 Assert.Equal("4", traces[3].Message);
-                Assert.Equal(5, traces[3].Properties.Count);
+                Assert.Equal(6, traces[3].Properties.Count);
             }
         }
 

@@ -3,11 +3,11 @@
 
 using System;
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reactive.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Azure.WebJobs.Logging;
@@ -17,6 +17,7 @@ using Microsoft.Azure.WebJobs.Script.IO;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using IApplicationLifetime = Microsoft.AspNetCore.Hosting.IApplicationLifetime;
 
 namespace Microsoft.Azure.WebJobs.Script.WebHost
 {
@@ -24,25 +25,37 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
     {
         private readonly ScriptJobHostOptions _scriptOptions;
         private readonly IScriptEventManager _eventManager;
-        private readonly IScriptJobHostEnvironment _scriptEnvironment;
+        private readonly IApplicationLifetime _applicationLifetime;
+        private readonly IScriptHostManager _scriptHostManager;
+        private readonly IEnvironment _environment;
         private readonly string _hostLogPath;
         private readonly ILogger _logger;
+        private readonly ILogger<FileMonitoringService> _typedLogger;
         private readonly IList<IDisposable> _eventSubscriptions = new List<IDisposable>();
         private readonly Func<Task> _restart;
         private readonly Action _shutdown;
+        private readonly ImmutableArray<string> _rootDirectorySnapshot;
         private AutoRecoveringFileSystemWatcher _debugModeFileWatcher;
         private AutoRecoveringFileSystemWatcher _diagnosticModeFileWatcher;
         private FileWatcherEventSource _fileEventSource;
         private bool _shutdownScheduled;
+        private int _restartRequested;
         private bool _disposed = false;
+        private bool _watchersStopped = false;
+        private object _stopWatchersLock = new object();
 
-        public FileMonitoringService(IOptions<ScriptJobHostOptions> scriptOptions, ILoggerFactory loggerFactory, IScriptEventManager eventManager, IScriptJobHostEnvironment scriptEnvironment)
+        public FileMonitoringService(IOptions<ScriptJobHostOptions> scriptOptions, ILoggerFactory loggerFactory, IScriptEventManager eventManager, IApplicationLifetime applicationLifetime, IScriptHostManager scriptHostManager, IEnvironment environment)
         {
             _scriptOptions = scriptOptions.Value;
             _eventManager = eventManager;
-            _scriptEnvironment = scriptEnvironment;
+            _applicationLifetime = applicationLifetime;
+            _scriptHostManager = scriptHostManager;
             _hostLogPath = Path.Combine(_scriptOptions.RootLogPath, "Host");
             _logger = loggerFactory.CreateLogger(LogCategories.Startup);
+            _environment = environment;
+
+            // Use this for newer logs as we can't change existing categories of log messages
+            _typedLogger = loggerFactory.CreateLogger<FileMonitoringService>();
 
             // If a file change should result in a restart, we debounce the event to
             // ensure that only a single restart is triggered within a specific time window.
@@ -54,6 +67,23 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
             _shutdown = Shutdown;
             _shutdown = _shutdown.Debounce(milliseconds: 500);
+            _rootDirectorySnapshot = GetDirectorySnapshot();
+        }
+
+        internal ImmutableArray<string> GetDirectorySnapshot()
+        {
+            if (_scriptOptions.RootScriptPath != null)
+            {
+                try
+                {
+                    return Directory.EnumerateDirectories(_scriptOptions.RootScriptPath).ToImmutableArray();
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    _logger.LogInformation($"Unable to get directory snapshot. No directory present at {_scriptOptions.RootScriptPath}");
+                }
+            }
+            return ImmutableArray<string>.Empty;
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
@@ -64,6 +94,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         public Task StopAsync(CancellationToken cancellationToken)
         {
+            StopFileWatchers();
             return Task.CompletedTask;
         }
 
@@ -72,16 +103,6 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
         /// </summary>
         private void InitializeFileWatchers()
         {
-            _debugModeFileWatcher = new AutoRecoveringFileSystemWatcher(_hostLogPath, ScriptConstants.DebugSentinelFileName,
-                   includeSubdirectories: false, changeTypes: WatcherChangeTypes.Created | WatcherChangeTypes.Changed);
-            _debugModeFileWatcher.Changed += OnDebugModeFileChanged;
-            _logger.LogDebug("Debug file watch initialized.");
-
-            _diagnosticModeFileWatcher = new AutoRecoveringFileSystemWatcher(_hostLogPath, ScriptConstants.DiagnosticSentinelFileName,
-                   includeSubdirectories: false, changeTypes: WatcherChangeTypes.Created | WatcherChangeTypes.Changed);
-            _diagnosticModeFileWatcher.Changed += OnDiagnosticModeFileChanged;
-            _logger.LogDebug("Diagnostic file watch initialized.");
-
             if (_scriptOptions.FileWatchingEnabled)
             {
                 _fileEventSource = new FileWatcherEventSource(_eventManager, EventSources.ScriptFiles, _scriptOptions.RootScriptPath);
@@ -97,6 +118,78 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                     .Subscribe((msg) => ScheduleRestartAsync(false)
                     .ContinueWith(t => _logger.LogCritical(t.Exception.Message),
                         TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously)));
+
+            // Delay starting up for logging and debug file watchers to avoid long start up times
+            Utility.ExecuteAfterColdStartDelay(_environment, InitializeSecondaryFileWatchers);
+        }
+
+        /// <summary>
+        /// Initializes the file and directory monitoring that does not need to happen as part of a Host startup
+        /// These watchers can be started after a delay to avoid startup performance issue
+        /// </summary>
+        private void InitializeSecondaryFileWatchers()
+        {
+            if (_watchersStopped)
+            {
+                return;
+            }
+
+            lock (_stopWatchersLock)
+            {
+                if (!_watchersStopped)
+                {
+                    FileUtility.EnsureDirectoryExists(_hostLogPath);
+
+                    _debugModeFileWatcher = new AutoRecoveringFileSystemWatcher(_hostLogPath, ScriptConstants.DebugSentinelFileName,
+                            includeSubdirectories: false, changeTypes: WatcherChangeTypes.Created | WatcherChangeTypes.Changed);
+                    _debugModeFileWatcher.Changed += OnDebugModeFileChanged;
+                    _logger.LogDebug("Debug file watch initialized.");
+
+                    _diagnosticModeFileWatcher = new AutoRecoveringFileSystemWatcher(_hostLogPath, ScriptConstants.DiagnosticSentinelFileName,
+                           includeSubdirectories: false, changeTypes: WatcherChangeTypes.Created | WatcherChangeTypes.Changed);
+                    _diagnosticModeFileWatcher.Changed += OnDiagnosticModeFileChanged;
+                    _logger.LogDebug("Diagnostic file watch initialized.");
+                }
+            }
+        }
+
+        private void StopFileWatchers()
+        {
+            if (_watchersStopped)
+            {
+                return;
+            }
+
+            lock (_stopWatchersLock)
+            {
+                if (_watchersStopped)
+                {
+                    return;
+                }
+
+                _typedLogger.LogDebug("Stopping file watchers.");
+
+                _fileEventSource?.Dispose();
+
+                if (_debugModeFileWatcher != null)
+                {
+                    _debugModeFileWatcher.Changed -= OnDebugModeFileChanged;
+                    _debugModeFileWatcher.Dispose();
+                }
+
+                if (_diagnosticModeFileWatcher != null)
+                {
+                    _diagnosticModeFileWatcher.Changed -= OnDiagnosticModeFileChanged;
+                    _diagnosticModeFileWatcher.Dispose();
+                }
+
+                foreach (var subscription in _eventSubscriptions)
+                {
+                    subscription.Dispose();
+                }
+
+                _watchersStopped = true;
+            }
         }
 
         /// <summary>
@@ -162,7 +255,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
                 changeDescription = "File";
             }
             else if ((e.ChangeType == WatcherChangeTypes.Deleted || Directory.Exists(e.FullPath))
-                && !_scriptOptions.RootScriptDirectorySnapshot.SequenceEqual(Directory.EnumerateDirectories(_scriptOptions.RootScriptPath)))
+                && !_rootDirectorySnapshot.SequenceEqual(Directory.EnumerateDirectories(_scriptOptions.RootScriptPath)))
             {
                 // Check directory snapshot only if "Deleted" change or if directory changed
                 changeDescription = "Directory";
@@ -224,9 +317,9 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         private Task RestartAsync()
         {
-            if (!_shutdownScheduled)
+            if (!_shutdownScheduled && Interlocked.Exchange(ref _restartRequested, 1) == 0)
             {
-                _scriptEnvironment.RestartHost();
+                return _scriptHostManager.RestartHostAsync();
             }
 
             return Task.CompletedTask;
@@ -234,7 +327,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
 
         private void Shutdown()
         {
-            _scriptEnvironment.Shutdown();
+            _applicationLifetime.StopApplication();
         }
 
         protected virtual void Dispose(bool disposing)
@@ -243,24 +336,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost
             {
                 if (disposing)
                 {
-                    _fileEventSource?.Dispose();
-
-                    if (_debugModeFileWatcher != null)
-                    {
-                        _debugModeFileWatcher.Changed -= OnDebugModeFileChanged;
-                        _debugModeFileWatcher.Dispose();
-                    }
-
-                    if (_diagnosticModeFileWatcher != null)
-                    {
-                        _diagnosticModeFileWatcher.Changed -= OnDiagnosticModeFileChanged;
-                        _diagnosticModeFileWatcher.Dispose();
-                    }
-
-                    foreach (var subscription in _eventSubscriptions)
-                    {
-                        subscription.Dispose();
-                    }
+                    StopFileWatchers();
                 }
 
                 _disposed = true;

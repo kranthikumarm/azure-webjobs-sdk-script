@@ -6,10 +6,14 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Dynamic;
 using System.Globalization;
+using System.IO.Abstractions;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Azure.WebJobs.Logging;
+using Microsoft.Azure.WebJobs.Script.Description;
 using Microsoft.WebJobs.Script.Tests;
+using Moq;
 using Newtonsoft.Json.Linq;
 using Xunit;
 
@@ -99,6 +103,27 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         }
 
         [Theory]
+        [InlineData("Function1", "Function1", "en-US", true)]
+        [InlineData("function1", "Function1", "en-US", true)]
+        [InlineData("Função", "FunçÃo", "pt-BR", true)]
+        [InlineData("HttptRIGGER", "Httptrigger", "ja-JP", true)]
+        [InlineData("Iasdf1", "iasdf1", "tr-TR", true)]
+        public void FunctionNamesMatch_ReturnsExpectedResult(string functionNameA, string functionNameB, string cultureInfo, bool expectMatch)
+        {
+            CultureInfo environmentCulture = Thread.CurrentThread.CurrentCulture;
+
+            try
+            {
+                Thread.CurrentThread.CurrentCulture = new CultureInfo(cultureInfo);
+                Assert.Equal(expectMatch, Utility.FunctionNamesMatch(functionNameA, functionNameB));
+            }
+            finally
+            {
+                Thread.CurrentThread.CurrentCulture = environmentCulture;
+            }
+        }
+
+        [Theory]
         [InlineData(1, null, null, null, "00:00:00")]
         [InlineData(2, null, null, null, "00:00:02")]
         [InlineData(3, null, null, null, "00:00:04")]
@@ -136,6 +161,29 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             TimeSpan result = Utility.ComputeBackoff(exponent, unit, min, max);
             TimeSpan expectedTimespan = TimeSpan.Parse(expected);
             Assert.Equal(expectedTimespan, result);
+        }
+
+        [Theory]
+        [InlineData("00:02:00", "00:02:00")]
+        [InlineData(null, "10675199.02:48:05.4775807")]
+        public void ComputeBackoff_Overflow(string maxValue, string expected)
+        {
+            TimeSpan? max = null;
+            if (maxValue != null)
+            {
+                max = TimeSpan.Parse(maxValue);
+            }
+
+            TimeSpan expectedValue = TimeSpan.Parse(expected);
+
+            // Catches two overflow bugs:
+            // 1. Computed ticks would fluctuate between positive and negative, resulting in min-and-max alternating.
+            // 2. At 64+ we'd throw an OverflowException.
+            for (int i = 60; i < 70; i++)
+            {
+                TimeSpan result = Utility.ComputeBackoff(i, min: TimeSpan.FromSeconds(1), max: max);
+                Assert.Equal(expectedValue, result);
+            }
         }
 
         [Theory]
@@ -371,6 +419,194 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
             Thread.CurrentThread.CurrentCulture = new CultureInfo(cultureInfo);
             Assert.Equal(expectedResult, Utility.IsValidFunctionName(functionName));
             Thread.CurrentThread.CurrentCulture = defaultCulture;
+        }
+
+        [Theory]
+        [InlineData("node", "node")]
+        [InlineData("java", "java")]
+        [InlineData("", "node")]
+        [InlineData(null, "java")]
+        public void IsSupported_Returns_True(string language, string funcMetadataLanguage)
+        {
+            FunctionMetadata func1 = new FunctionMetadata()
+            {
+                Name = "func1",
+                Language = funcMetadataLanguage
+            };
+            Assert.True(Utility.IsFunctionMetadataLanguageSupportedByWorkerRuntime(func1, language));
+        }
+
+        [Theory]
+        [InlineData("node", "java")]
+        [InlineData("java", "node")]
+        [InlineData("python", "")]
+        public void IsSupported_Returns_False(string language, string funcMetadataLanguage)
+        {
+            FunctionMetadata func1 = new FunctionMetadata()
+            {
+                Name = "func1",
+                Language = funcMetadataLanguage
+            };
+            Assert.False(Utility.IsFunctionMetadataLanguageSupportedByWorkerRuntime(func1, language));
+        }
+
+        [Fact]
+        public void GetValidFunctions_Returns_Expected()
+        {
+            FunctionMetadata func1 = new FunctionMetadata()
+            {
+                Name = "func1",
+                Language = "java"
+            };
+            FunctionMetadata func2 = new FunctionMetadata()
+            {
+                Name = "func2",
+                Language = "node"
+            };
+
+            FunctionDescriptor fd = new FunctionDescriptor();
+            fd.Metadata = func1;
+
+            IEnumerable<FunctionMetadata> functionMetadatas = new List<FunctionMetadata>
+            {
+                 func1, func2
+            };
+            ICollection<FunctionDescriptor> functionDescriptors = new List<FunctionDescriptor>
+            {
+                 fd
+            };
+            IEnumerable<FunctionMetadata> validFunctions = Utility.GetValidFunctions(functionMetadatas, functionDescriptors);
+            int validFunctionsCount = 0;
+            foreach (var metadata in validFunctions)
+            {
+                Assert.Equal(func1.Name, metadata.Name);
+                validFunctionsCount++;
+            }
+            Assert.True(validFunctionsCount == 1);
+        }
+
+        [Fact]
+        public void GetValidFunctions_Returns_Null()
+        {
+            FunctionMetadata func1 = new FunctionMetadata()
+            {
+                Name = "func1",
+                Language = "java"
+            };
+            FunctionMetadata func2 = new FunctionMetadata()
+            {
+                Name = "func2",
+                Language = "node"
+            };
+            FunctionMetadata func3 = new FunctionMetadata()
+            {
+                Name = "func3",
+                Language = "node"
+            };
+
+            FunctionDescriptor fd = new FunctionDescriptor();
+            fd.Metadata = func3;
+
+            IEnumerable<FunctionMetadata> functionMetadatas = new List<FunctionMetadata>
+            {
+                 func1, func2
+            };
+            ICollection<FunctionDescriptor> functionDescriptors = new List<FunctionDescriptor>
+            {
+                 fd
+            };
+
+            IEnumerable<FunctionMetadata> validFunctions = Utility.GetValidFunctions(null, functionDescriptors);
+            Assert.Null(validFunctions);
+
+            validFunctions = Utility.GetValidFunctions(functionMetadatas, null);
+            Assert.Null(validFunctions);
+
+            validFunctions = Utility.GetValidFunctions(functionMetadatas, functionDescriptors);
+            Assert.Empty(validFunctions);
+        }
+
+        [Theory]
+        [InlineData(true, true, true)]
+        [InlineData(true, false, false)]
+        [InlineData(false, true, false)]
+        [InlineData(false, false, false)]
+        public void AppOfflineTests(bool isLinuxContainerEnvironment, bool containerDisabledFileExists, bool appOffline)
+        {
+            var vars = new Dictionary<string, string>
+            {
+                { EnvironmentSettingNames.AzureWebsiteInstanceId, isLinuxContainerEnvironment ? string.Empty : "Website_instance_id" },
+                { EnvironmentSettingNames.ContainerName, isLinuxContainerEnvironment ? "Container-Name" : string.Empty }
+            };
+
+            var fileSystem = new Mock<IFileSystem>();
+            fileSystem.Setup(f =>
+                    f.File.Exists(It.Is<string>(path => path.EndsWith(ScriptConstants.DisableContainerFileName))))
+                .Returns(containerDisabledFileExists);
+            FileUtility.Instance = fileSystem.Object;
+
+            var checkAppOffline = Utility.CheckAppOffline(new TestEnvironment(vars), string.Empty);
+            Assert.Equal(appOffline, checkAppOffline);
+
+            FileUtility.Instance = null;
+        }
+
+        [Theory]
+        [InlineData("", "", "DefaultEndpointsProtocol=https;AccountName=;AccountKey=")]
+        [InlineData(null, null, "DefaultEndpointsProtocol=https;AccountName=;AccountKey=")]
+        [InlineData("accountname", "password", "DefaultEndpointsProtocol=https;AccountName=accountname;AccountKey=password")]
+        public void BuildStorageConnectionString(string accountName, string accessKey, string expectedConnectionString)
+        {
+            Assert.Equal(expectedConnectionString, Utility.BuildStorageConnectionString(accountName, accessKey));
+        }
+
+        [Fact]
+        public void ResolveFunctionName_StateWins()
+        {
+            var state = new Dictionary<string, object>
+            {
+                { "functionName", "A" }
+            };
+
+            var scope = new Dictionary<string, object>
+            {
+                { ScopeKeys.FunctionName, "B" }
+            };
+
+            Assert.Equal("A", Utility.ResolveFunctionName(state, scope));
+        }
+
+        [Fact]
+        public void ResolveFunctionName_LastStateWins()
+        {
+            var state = new Dictionary<string, object>
+            {
+                { "functionName", "A" },
+                { LogConstants.NameKey, "C" },
+            };
+
+            var scope = new Dictionary<string, object>
+            {
+                { ScopeKeys.FunctionName, "B" }
+            };
+
+            Assert.Equal("C", Utility.ResolveFunctionName(state, scope));
+        }
+
+        [Fact]
+        public void ResolveFunctionName_Scope()
+        {
+            var state = new Dictionary<string, object>
+            {
+                { "notFunctionName", "A" },
+            };
+
+            var scope = new Dictionary<string, object>
+            {
+                { ScopeKeys.FunctionName, "B" }
+            };
+
+            Assert.Equal("B", Utility.ResolveFunctionName(state, scope));
         }
     }
 }

@@ -1,11 +1,10 @@
 ﻿// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
-using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Hosting;
 using Microsoft.Azure.WebJobs.Script.Eventing;
 using Microsoft.Azure.WebJobs.Script.WebHost;
 using Microsoft.Extensions.Logging;
@@ -25,6 +24,36 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
         public static void GetRelativeDirectory_ReturnsExpectedDirectoryName(string path, string expected)
         {
             Assert.Equal(expected, FileMonitoringService.GetRelativeDirectory(path, @"C:\Functions\Scripts"));
+        }
+
+        [Theory]
+        [InlineData(@"NonExistentPath")]
+        [InlineData(null)]
+        public void InitializesEmptyOrMissingDirectorySnapshot(string rootScriptPath)
+        {
+            using (var directory = new TempDirectory())
+            {
+                // Setup
+                string tempDir = directory.Path;
+                Directory.CreateDirectory(Path.Combine(tempDir, "Host"));
+
+                var fileMonitoringService = GetFileMonitoringService(tempDir, rootScriptPath);
+                Assert.False(fileMonitoringService.GetDirectorySnapshot().IsDefault);
+                Assert.True(fileMonitoringService.GetDirectorySnapshot().IsEmpty);
+            }
+        }
+
+        [Fact]
+        public void InitializesGetDirectorySnapshot()
+        {
+            using (var directory = new TempDirectory())
+            {
+                string tempDir = directory.Path;
+                Directory.CreateDirectory(Path.Combine(tempDir, "Host"));
+                var fileMonitoringService = GetFileMonitoringService(tempDir, tempDir);
+                Assert.Equal(fileMonitoringService.GetDirectorySnapshot().Length, 1);
+                Assert.Equal(fileMonitoringService.GetDirectorySnapshot()[0], Path.Combine(tempDir, "Host"));
+            }
         }
 
         [Theory]
@@ -49,12 +78,14 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                     FileWatchingEnabled = true
                 };
                 var loggerFactory = new LoggerFactory();
-                var mockWebHostEnvironment = new Mock<IScriptJobHostEnvironment>(MockBehavior.Loose);
+                var mockApplicationLifetime = new Mock<IApplicationLifetime>();
+                var mockScriptHostManager = new Mock<IScriptHostManager>();
                 var mockEventManager = new ScriptEventManager();
+                var environment = new TestEnvironment();
 
                 // Act
                 FileMonitoringService fileMonitoringService = new FileMonitoringService(new OptionsWrapper<ScriptJobHostOptions>(jobHostOptions),
-                    loggerFactory, mockEventManager, mockWebHostEnvironment.Object);
+                    loggerFactory, mockEventManager, mockApplicationLifetime.Object, mockScriptHostManager.Object, environment);
                 await fileMonitoringService.StartAsync(new CancellationToken(canceled: false));
 
                 var offlineEventArgs = new FileSystemEventArgs(WatcherChangeTypes.Created, tempDir, fileName);
@@ -70,22 +101,42 @@ namespace Microsoft.Azure.WebJobs.Script.Tests
                 // Test
                 if (expectShutdown)
                 {
-                    mockWebHostEnvironment.Verify(m => m.Shutdown());
+                    mockApplicationLifetime.Verify(m => m.StopApplication());
                 }
                 else
                 {
-                    mockWebHostEnvironment.Verify(m => m.Shutdown(), Times.Never);
+                    mockApplicationLifetime.Verify(m => m.StopApplication(), Times.Never);
                 }
 
                 if (expectRestart)
                 {
-                    mockWebHostEnvironment.Verify(m => m.RestartHost());
+                    mockScriptHostManager.Verify(m => m.RestartHostAsync(default));
                 }
                 else
                 {
-                    mockWebHostEnvironment.Verify(m => m.RestartHost(), Times.Never);
+                    mockScriptHostManager.Verify(m => m.RestartHostAsync(default), Times.Never);
                 }
             }
+        }
+
+        public FileMonitoringService GetFileMonitoringService(string tempDir, string rootScriptPath)
+        {
+            File.Create(Path.Combine(tempDir, "host.json"));
+
+            var jobHostOptions = new ScriptJobHostOptions
+            {
+                RootLogPath = tempDir,
+                RootScriptPath = rootScriptPath,
+                FileWatchingEnabled = true
+            };
+            var loggerFactory = new LoggerFactory();
+            var mockApplicationLifetime = new Mock<IApplicationLifetime>();
+            var mockScriptHostManager = new Mock<IScriptHostManager>();
+            var mockEventManager = new ScriptEventManager();
+            var environment = new TestEnvironment();
+
+            // Act
+            return new FileMonitoringService(new OptionsWrapper<ScriptJobHostOptions>(jobHostOptions), loggerFactory, mockEventManager, mockApplicationLifetime.Object, mockScriptHostManager.Object, environment);
         }
     }
 }

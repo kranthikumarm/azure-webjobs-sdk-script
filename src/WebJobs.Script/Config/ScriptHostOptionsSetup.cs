@@ -2,10 +2,8 @@
 // Licensed under the MIT License. See License.txt in the project root for license information.
 
 using System;
-using System.Globalization;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Options;
-using static Microsoft.Azure.WebJobs.Script.Rpc.LanguageWorkerConstants;
 
 namespace Microsoft.Azure.WebJobs.Script.Configuration
 {
@@ -55,7 +53,7 @@ namespace Microsoft.Azure.WebJobs.Script.Configuration
 
             // If we have a read only file system, override any configuration and
             // disable file watching
-            if (_environment.FileSystemIsReadOnly())
+            if (_environment.IsFileSystemReadOnly())
             {
                 options.FileWatchingEnabled = false;
             }
@@ -72,9 +70,9 @@ namespace Microsoft.Azure.WebJobs.Script.Configuration
         {
             if (options.FunctionTimeout == null)
             {
-                options.FunctionTimeout = _environment.IsDynamic() ? DefaultFunctionTimeoutDynamic : DefaultFunctionTimeout;
+                options.FunctionTimeout = _environment.IsWindowsConsumption() ? DefaultFunctionTimeoutDynamic : DefaultFunctionTimeout;
             }
-            else if (!_environment.IsDynamic() && TimeSpan.Compare(options.FunctionTimeout.Value, TimeSpan.FromDays(-1)) == 0)
+            else if (!_environment.IsWindowsConsumption() && TimeSpan.Compare(options.FunctionTimeout.Value, TimeSpan.FromDays(-1)) == 0)
             {
                 // If a value of -1 is specified on a dedicated host, it should result in an infinite timeout
                 options.FunctionTimeout = null;
@@ -90,7 +88,7 @@ namespace Microsoft.Azure.WebJobs.Script.Configuration
             if (timeoutValue != null)
             {
                 var maxTimeout = TimeSpan.MaxValue;
-                if (_environment.IsDynamic())
+                if (_environment.IsWindowsConsumption())
                 {
                     maxTimeout = MaxFunctionTimeoutDynamic;
                 }

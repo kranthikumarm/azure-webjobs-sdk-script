@@ -15,13 +15,16 @@ using Microsoft.AspNetCore.Mvc.WebApiCompatShim;
 using Microsoft.Azure.WebJobs.Extensions.Http;
 using Microsoft.Azure.WebJobs.Host;
 using Microsoft.Azure.WebJobs.Host.Executors;
+using Microsoft.Azure.WebJobs.Host.Scale;
+using Microsoft.Azure.WebJobs.Script.ExtensionBundle;
+using Microsoft.Azure.WebJobs.Script.Scale;
 using Microsoft.Azure.WebJobs.Script.WebHost.Authentication;
 using Microsoft.Azure.WebJobs.Script.WebHost.Filters;
 using Microsoft.Azure.WebJobs.Script.WebHost.Management;
 using Microsoft.Azure.WebJobs.Script.WebHost.Models;
-using Microsoft.Azure.WebJobs.Script.WebHost.Security;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization;
 using Microsoft.Azure.WebJobs.Script.WebHost.Security.Authorization.Policies;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Newtonsoft.Json;
@@ -44,6 +47,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
         private readonly IEnvironment _environment;
         private readonly IScriptHostManager _scriptHostManager;
         private readonly IFunctionsSyncManager _functionsSyncManager;
+        private static int _warmupExecuted;
 
         public HostController(IOptions<ScriptApplicationHostOptions> applicationHostOptions,
             IOptions<JobHostOptions> hostOptions,
@@ -68,15 +72,30 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
         [Route("admin/host/status")]
         [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
         [TypeFilter(typeof(EnableDebugModeFilter))]
-        public async Task<IActionResult> GetHostStatus([FromServices] IScriptHostManager scriptHostManager, [FromServices] IHostIdProvider hostIdProvider)
+        public async Task<IActionResult> GetHostStatus([FromServices] IScriptHostManager scriptHostManager, [FromServices] IHostIdProvider hostIdProvider, [FromServices] IServiceProvider serviceProvider = null)
         {
             var status = new HostStatus
             {
                 State = scriptHostManager.State.ToString(),
                 Version = ScriptHost.Version,
                 VersionDetails = Utility.GetInformationalVersion(typeof(ScriptHost)),
-                Id = await hostIdProvider.GetHostIdAsync(CancellationToken.None)
+                Id = await hostIdProvider.GetHostIdAsync(CancellationToken.None),
+                ProcessUptime = (long)(DateTime.UtcNow - Process.GetCurrentProcess().StartTime).TotalMilliseconds
             };
+
+            var bundleManager = serviceProvider.GetService<IExtensionBundleManager>();
+            if (bundleManager != null)
+            {
+                var bundleInfo = await bundleManager.GetExtensionBundleDetails();
+                if (bundleInfo != null)
+                {
+                    status.ExtensionBundle = new Models.ExtensionBundle()
+                    {
+                        Id = bundleInfo.Id,
+                        Version = bundleInfo.Version
+                    };
+                }
+            }
 
             var lastError = scriptHostManager.LastError;
             if (lastError != null)
@@ -106,6 +125,24 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             _logger.Log(LogLevel.Debug, new EventId(0, "PingStatus"), message);
 
             return Ok();
+        }
+
+        [HttpPost]
+        [Route("admin/host/scale/status")]
+        [Authorize(Policy = PolicyNames.AdminAuthLevelOrInternal)]
+        [ResponseCache(NoStore = true, Location = ResponseCacheLocation.None)]
+        [RequiresRunningHost]
+        public async Task<IActionResult> GetScaleStatus([FromBody] ScaleStatusContext context, [FromServices] FunctionsScaleManager scaleManager)
+        {
+            // if runtime scale isn't enabled return error
+            if (!_environment.IsRuntimeScaleMonitoringEnabled())
+            {
+                return BadRequest("Runtime scale monitoring is not enabled.");
+            }
+
+            var scaleStatus = await scaleManager.GetScaleStatusAsync(context);
+
+            return new ObjectResult(scaleStatus);
         }
 
         [HttpPost]
@@ -204,7 +241,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             }
             else if (desiredState == ScriptHostState.Running && currentState == ScriptHostState.Offline)
             {
-                if (_environment.FileSystemIsReadOnly())
+                if (_environment.IsFileSystemReadOnly())
                 {
                     return BadRequest();
                 }
@@ -214,7 +251,7 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             }
             else if (desiredState == ScriptHostState.Offline && currentState != ScriptHostState.Offline)
             {
-                if (_environment.FileSystemIsReadOnly())
+                if (_environment.IsFileSystemReadOnly())
                 {
                     return BadRequest();
                 }
@@ -230,44 +267,48 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Controllers
             return Accepted();
         }
 
-        /// <summary>
-        /// This endpoint generates a temporary x-ms-site-restricted-token for core tool
-        /// to access KuduLite zipdeploy endpoint in Linux Consumption
-        /// </summary>
-        /// <returns>
-        /// 200 on token generated
-        /// 400 on non-Linux container environment
-        /// </returns>
         [HttpGet]
-        [Route("admin/host/token")]
-        [Authorize(Policy = PolicyNames.AdminAuthLevel)]
-        public IActionResult GetAdminToken()
+        [HttpPost]
+        [Route("admin/warmup")]
+        [RequiresRunningHost]
+        public async Task<IActionResult> Warmup([FromServices] IScriptHostManager scriptHostManager)
         {
-            if (!_environment.IsLinuxContainerEnvironment())
+            // Endpoint only for Windows Elastic Premium or Linux App Service plans
+            if (!(_environment.IsLinuxAppService() || _environment.IsWindowsElasticPremium()))
             {
-                return BadRequest("Endpoint is only available when running in Linux Container");
+                return BadRequest("This API is not available for the current hosting plan");
             }
 
-            string requestHeaderToken = SimpleWebTokenHelper.CreateToken(DateTime.UtcNow.AddMinutes(5));
-            return Ok(requestHeaderToken);
+            if (Interlocked.CompareExchange(ref _warmupExecuted, 1, 0) != 0)
+            {
+                return Ok();
+            }
+
+            if (scriptHostManager is IServiceProvider serviceProvider)
+            {
+                IScriptJobHost jobHost = serviceProvider.GetService<IScriptJobHost>();
+
+                if (jobHost == null)
+                {
+                    _logger.LogError($"No active host available.");
+                    return StatusCode(503);
+                }
+
+                await jobHost.TryInvokeWarmupAsync();
+                return Ok();
+            }
+
+            return BadRequest("This API is not supported by the current hosting environment.");
         }
 
         [AcceptVerbs("GET", "POST", "DELETE")]
-        [Authorize(AuthenticationSchemes = AuthLevelAuthenticationDefaults.AuthenticationScheme)]
-        [Route("runtime/webhooks/{name}/{*extra}")]
+        [Authorize(Policy = PolicyNames.SystemKeyAuthLevel)]
+        [Route("runtime/webhooks/{extensionName}/{*extra}")]
         [RequiresRunningHost]
-        public async Task<IActionResult> ExtensionWebHookHandler(string name, CancellationToken token, [FromServices] IScriptWebHookProvider provider)
+        public async Task<IActionResult> ExtensionWebHookHandler(string extensionName, CancellationToken token, [FromServices] IScriptWebHookProvider provider)
         {
-            if (provider.TryGetHandler(name, out HttpHandler handler))
+            if (provider.TryGetHandler(extensionName, out HttpHandler handler))
             {
-                // must either be authorized at the admin level, or system level with
-                // a matching key name
-                string keyName = DefaultScriptWebHookProvider.GetKeyName(name);
-                if (!AuthUtility.PrincipalHasAuthLevelClaim(User, AuthorizationLevel.System, keyName))
-                {
-                    return Unauthorized();
-                }
-
                 var requestMessage = new HttpRequestMessageFeature(this.HttpContext).HttpRequestMessage;
                 HttpResponseMessage response = await handler.ConvertAsync(requestMessage, token);
 

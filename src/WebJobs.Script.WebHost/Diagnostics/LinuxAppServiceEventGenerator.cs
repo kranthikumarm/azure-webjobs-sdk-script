@@ -9,13 +9,15 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
     internal class LinuxAppServiceEventGenerator : LinuxEventGenerator
     {
         private readonly LinuxAppServiceFileLoggerFactory _loggerFactory;
+        private readonly HostNameProvider _hostNameProvider;
 
-        public LinuxAppServiceEventGenerator(LinuxAppServiceFileLoggerFactory loggerFactory)
+        public LinuxAppServiceEventGenerator(LinuxAppServiceFileLoggerFactory loggerFactory, HostNameProvider hostNameProvider)
         {
             _loggerFactory = loggerFactory;
+            _hostNameProvider = hostNameProvider ?? throw new ArgumentNullException(nameof(hostNameProvider));
         }
 
-        public static string TraceEventRegex { get; } = $"(?<Level>[0-6]),(?<SubscriptionId>[^,]*),(?<AppName>[^,]*),(?<FunctionName>[^,]*),(?<EventName>[^,]*),(?<Source>[^,]*),\"(?<Details>.*)\",\"(?<Summary>.*)\",(?<HostVersion>[^,]*),(?<EventTimestamp>[^,]+),(?<ExceptionType>[^,]*),\"(?<ExceptionMessage>.*)\",(?<FunctionInvocationId>[^,]*),(?<HostInstanceId>[^,]*),(?<ActivityId>[^,\"]*)";
+        public static string TraceEventRegex { get; } = $"(?<Level>[0-6]),(?<SubscriptionId>[^,]*),(?<HostName>[^,]*),(?<AppName>[^,]*),(?<FunctionName>[^,]*),(?<EventName>[^,]*),(?<Source>[^,]*),\"(?<Details>.*)\",\"(?<Summary>.*)\",(?<HostVersion>[^,]*),(?<EventTimestamp>[^,]+),(?<ExceptionType>[^,]*),\"(?<ExceptionMessage>.*)\",(?<FunctionInvocationId>[^,]*),(?<HostInstanceId>[^,]*),(?<ActivityId>[^,\"]*)";
 
         public static string MetricEventRegex { get; } = $"(?<SubscriptionId>[^,]*),(?<AppName>[^,]*),(?<FunctionName>[^,]*),(?<EventName>[^,]*),(?<Average>\\d*),(?<Min>\\d*),(?<Max>\\d*),(?<Count>\\d*),(?<HostVersion>[^,]*),(?<EventTimestamp>[^,]+),(?<Details>[^,\"]*)";
 
@@ -23,18 +25,19 @@ namespace Microsoft.Azure.WebJobs.Script.WebHost.Diagnostics
 
         public override void LogFunctionTraceEvent(LogLevel level, string subscriptionId, string appName, string functionName, string eventName,
             string source, string details, string summary, string exceptionType, string exceptionMessage,
-            string functionInvocationId, string hostInstanceId, string activityId)
+            string functionInvocationId, string hostInstanceId, string activityId, string runtimeSiteName, string slotName)
         {
             var eventTimestamp = DateTime.UtcNow.ToString(EventTimestampFormat);
             var hostVersion = ScriptHost.Version;
+            var hostName = _hostNameProvider.Value;
             FunctionsSystemLogsEventSource.Instance.SetActivityId(activityId);
 
             var logger = _loggerFactory.GetOrCreate(FunctionsLogsCategory);
-            WriteEvent(logger, $"{(int)ToEventLevel(level)},{subscriptionId},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{eventTimestamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId}");
+            WriteEvent(logger, $"{(int)ToEventLevel(level)},{subscriptionId},{hostName},{appName},{functionName},{eventName},{source},{NormalizeString(details)},{NormalizeString(summary)},{hostVersion},{eventTimestamp},{exceptionType},{NormalizeString(exceptionMessage)},{functionInvocationId},{hostInstanceId},{activityId}");
         }
 
         public override void LogFunctionMetricEvent(string subscriptionId, string appName, string functionName, string eventName, long average,
-            long minimum, long maximum, long count, DateTime eventTimestamp, string data)
+            long minimum, long maximum, long count, DateTime eventTimestamp, string data, string runtimeSiteName, string slotName)
         {
             var hostVersion = ScriptHost.Version;
             var logger = _loggerFactory.GetOrCreate(FunctionsMetricsCategory);
